@@ -42,6 +42,12 @@ class ExecutorTaskHandler extends TaskHandler {
   // When "mobile data off" was last reported to the server (null = online
   // or not reported yet), see _loop.
   DateTime? _offlineReportedAt;
+  // «Белые списки» state: when the mode was last measured, the verdict
+  // waiting to be reported, and the last one the server knows about (what
+  // the notification text is based on).
+  DateTime? _whitelistProbedAt;
+  String? _pendingWhitelistVerdict;
+  String? _lastWhitelistVerdict;
   // Per-isolate id in every trace line: two service instances alive at once
   // would show up as two different ids interleaving.
   final String _instance = DateTime.now().millisecondsSinceEpoch.toRadixString(36);
@@ -170,12 +176,46 @@ class ExecutorTaskHandler extends TaskHandler {
 
         _hwid ??= await NativeBridge.hwid();
         final cc = await NativeBridge.networkCountry();
-        await _api.heartbeat(
+        final hb = await _api.heartbeat(
           mobileDataEnabled: true, isOnline: true, hwid: _hwid,
           operatorName: await NativeBridge.operatorName(),
           country: cc.network, simCountry: cc.sim,
+          // The verdict measured since the last heartbeat, if any.
+          whitelistVerdict: _pendingWhitelistVerdict,
         );
-        _report(status: 'online', title: 'Связь Есть? — онлайн', text: 'Ожидание заданий...');
+        if (_pendingWhitelistVerdict != null) {
+          _lastWhitelistVerdict = _pendingWhitelistVerdict;
+          _pendingWhitelistVerdict = null;
+        }
+
+        // «Белые списки»: re-measure on the server's schedule, not only when
+        // a job arrives -- the server decides whether this phone gets work
+        // at all from this verdict, so it has to exist beforehand.
+        final now = DateTime.now();
+        if (hb.canProbe &&
+            (_whitelistProbedAt == null || now.difference(_whitelistProbedAt!) >= hb.whitelistInterval)) {
+          _whitelistProbedAt = now;
+          final wl = await NativeBridge.whitelistProbe(hb.whitelistAllowed, hb.whitelistControl);
+          final verdict = wl['verdict'] as String?;
+          if (verdict != null && verdict != 'unknown') {
+            _pendingWhitelistVerdict = verdict;
+            _lastWhitelistVerdict = verdict;
+            await _trace('whitelist verdict=$verdict');
+          }
+        }
+
+        // Nothing to measure for a БС check while the operator is not in
+        // whitelist mode: say so plainly instead of "waiting for jobs",
+        // which would look like the network is idle.
+        if (hb.whitelistRequired && _lastWhitelistVerdict != null && _lastWhitelistVerdict != 'active') {
+          _report(
+            status: 'no_whitelist',
+            title: 'Связь Есть? — онлайн',
+            text: 'Белые списки у оператора не включены — заданий нет',
+          );
+        } else {
+          _report(status: 'online', title: 'Связь Есть? — онлайн', text: 'Ожидание заданий...');
+        }
 
         final job = await _api.pollJob();
         if (!_running) {

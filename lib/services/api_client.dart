@@ -14,6 +14,30 @@ import 'secure_store.dart';
 const String _defaultBaseUrl = 'https://dpichecker.st/executor/v1';
 const String apiBaseUrl = String.fromEnvironment('API_BASE_URL', defaultValue: _defaultBaseUrl);
 
+/// What the server sends back on every heartbeat: the «белые списки» probe
+/// configuration, so the phone can measure the mode on its own schedule
+/// instead of only while running a job.
+class HeartbeatReply {
+  const HeartbeatReply({
+    this.whitelistAllowed = const [],
+    this.whitelistControl = const [],
+    this.whitelistInterval = const Duration(minutes: 5),
+    this.whitelistRequired = true,
+  });
+
+  /// Hosts that stay reachable under a whitelist, and neutral ones that do
+  /// not -- the verdict is the comparison between them.
+  final List<String> whitelistAllowed;
+  final List<String> whitelistControl;
+  final Duration whitelistInterval;
+
+  /// Whether the server refuses jobs to phones outside whitelist mode
+  /// (admin-configurable). Only affects what the app tells the user.
+  final bool whitelistRequired;
+
+  bool get canProbe => whitelistAllowed.isNotEmpty && whitelistControl.isNotEmpty;
+}
+
 class ApiException implements Exception {
   ApiException(this.statusCode, this.message, [this.code]);
   final int statusCode;
@@ -153,16 +177,22 @@ class ApiClient {
     );
   }
 
-  Future<void> heartbeat({
+  /// Reports this phone's state and returns what the server wants back:
+  /// the «белые списки» probe hosts and how often to re-run them. The
+  /// verdict rides along on the next heartbeat after each measurement --
+  /// the server only hands out jobs while it says the operator is in
+  /// whitelist mode, so this is what keeps a phone in the pool.
+  Future<HeartbeatReply> heartbeat({
     required bool mobileDataEnabled,
     required bool isOnline,
     String? operatorName,
     String? hwid,
     String? country,
     String? simCountry,
+    String? whitelistVerdict,
   }) async {
     final token = await SecureStore.getDeviceToken();
-    if (token == null) return;
+    if (token == null) return const HeartbeatReply();
     final resp = await _client
         .post(
           _u('/heartbeat'),
@@ -174,10 +204,17 @@ class ApiClient {
             'hwid': ?hwid,
             'country': ?country,
             'sim_country': ?simCountry,
+            'whitelist_verdict': ?whitelistVerdict,
           }),
         )
         .timeout(const Duration(seconds: 15));
-    _decode(resp);
+    final body = _decode(resp);
+    return HeartbeatReply(
+      whitelistAllowed: (body['whitelist_allowed'] as List?)?.map((e) => e.toString()).toList() ?? const [],
+      whitelistControl: (body['whitelist_control'] as List?)?.map((e) => e.toString()).toList() ?? const [],
+      whitelistInterval: Duration(seconds: (body['whitelist_interval'] as num?)?.toInt() ?? 300),
+      whitelistRequired: body['whitelist_required'] != false,
+    );
   }
 
   /// Long-polls for one job. The server holds the connection ~25s; the
