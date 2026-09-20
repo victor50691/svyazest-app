@@ -153,6 +153,15 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                     mainHandler.post { result.success(reply) }
                 }.start()
             }
+            "subnetProbe" -> {
+                val cidr = call.argument<String>("cidr") ?: ""
+                val timeoutMs = call.argument<Int>("timeoutMs") ?: 1200
+                val concurrency = call.argument<Int>("concurrency") ?: 32
+                Thread {
+                    val reply = subnetProbe(cidr, timeoutMs, concurrency)
+                    mainHandler.post { result.success(reply) }
+                }.start()
+            }
             "cellularPost" -> {
                 val url = call.argument<String>("url") ?: ""
                 val body = call.argument<String>("body") ?: ""
@@ -458,6 +467,71 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             val icmpMs = runCatching { icmp.get(timeoutMs + 1000L, java.util.concurrent.TimeUnit.MILLISECONDS) }.getOrNull()
             val tcpMs = runCatching { tcp.get(timeoutMs + 1000L, java.util.concurrent.TimeUnit.MILLISECONDS) }.getOrNull()
             return mapOf("host" to host, "ip" to addr.hostAddress, "icmp_ms" to icmpMs, "tcp_ms" to tcpMs, "error" to null)
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    /** Walks every address of a /24 over the cellular link: ICMP echo plus a
+     *  TCP handshake on 443 and 80. Answers the question a single-address
+     *  check cannot -- whether the operator drops the whole subnet or just
+     *  some hosts in it -- so it has to visit all 256, not a sample.
+     *
+     *  Runs in its own pool rather than one hostProbe per address: 256
+     *  sequential probes would take minutes on a mobile link, and each
+     *  hostProbe also re-resolves DNS it does not need here. */
+    private fun subnetProbe(cidr: String, timeoutMs: Int, concurrency: Int): Map<String, Any?> {
+        val base = cidr.substringBefore('/')
+        val octets = base.split('.')
+        if (octets.size != 4) return mapOf("cidr" to cidr, "error" to "bad_cidr")
+        val prefix = octets.take(3).joinToString(".")
+        val net = waitForCellular(3000)
+            ?: return mapOf("cidr" to cidr, "error" to "no_cellular")
+
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(concurrency.coerceIn(1, 64))
+        try {
+            val tasks = (0..255).map { last ->
+                java.util.concurrent.Callable {
+                    val addr = java.net.InetAddress.getByName("$prefix.$last")
+                    val icmp = icmpPing(net, addr, timeoutMs)
+                    // 443 first: an https host is the common case, and 80 is
+                    // only worth the extra handshake when 443 stays silent.
+                    val tcp443 = tcpConnect(net, addr, 443, timeoutMs)
+                    val tcp80 = if (tcp443 == null) tcpConnect(net, addr, 80, timeoutMs) else null
+                    mapOf(
+                        "ip" to "$prefix.$last",
+                        "icmp_ms" to icmp,
+                        "tcp443_ms" to tcp443,
+                        "tcp80_ms" to tcp80,
+                    )
+                }
+            }
+            val started = System.nanoTime()
+            // One bounded wait for the whole sweep: a stuck address must not
+            // hold the job open past the lease the server granted.
+            val futures = pool.invokeAll(tasks, (timeoutMs.toLong() * 12) + 20_000, java.util.concurrent.TimeUnit.MILLISECONDS)
+            val hosts = ArrayList<Map<String, Any?>>()
+            var probed = 0
+            for (f in futures) {
+                val r = runCatching { f.get() }.getOrNull() ?: continue
+                probed++
+                if (r["icmp_ms"] != null || r["tcp443_ms"] != null || r["tcp80_ms"] != null) hosts.add(r)
+            }
+            return mapOf(
+                "cidr" to cidr,
+                "probed" to probed,
+                "total" to 256,
+                "alive" to hosts.size,
+                "alive_icmp" to hosts.count { it["icmp_ms"] != null },
+                "alive_tcp" to hosts.count { it["tcp443_ms"] != null || it["tcp80_ms"] != null },
+                // The live ones only: 256 rows per job would bloat every
+                // result row in the database for no added meaning.
+                "hosts" to hosts.take(40),
+                "elapsed_ms" to (System.nanoTime() - started) / 1_000_000L,
+                "error" to null,
+            )
+        } catch (e: Exception) {
+            return mapOf("cidr" to cidr, "error" to (e.message ?: e.toString()))
         } finally {
             pool.shutdownNow()
         }

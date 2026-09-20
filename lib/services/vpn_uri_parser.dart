@@ -1,12 +1,25 @@
 import 'dart:convert';
 
-/// Parses the common VLESS/VMESS/TROJAN/SHADOWSOCKS/HYSTERIA2 share-link
-/// formats into a normalized shape that build_xray_config.dart turns into
-/// an Xray outbound. Deliberately covers the mainstream cases (TCP/WS/gRPC,
-/// TLS/REALITY/none) rather than every exotic transport combination that
-/// exists in the wild -- an unrecognized combination surfaces as
-/// `unsupported`, not a crash, matching this project's server-side
-/// vpn_checker.py's own "reject what we can't honestly test" stance.
+/// Parses VLESS/VMESS/TROJAN/SHADOWSOCKS/HYSTERIA2 share links into a
+/// normalized shape that build_xray_config.dart turns into an Xray outbound.
+///
+/// Deliberately mirrors the server side's services/vpn_checker.py
+/// (parse_vpn_uri / _parse_vmess_uri): the embedded core here is the exact
+/// same Xray build the bot runs (v26.3.27, commit d2758a0), so a key must
+/// produce the same outbound on the phone as it does on a PoP -- otherwise
+/// the same key gets two different verdicts depending on which vantage
+/// point happened to test it. Like that module, everything the link carries
+/// is kept in [params] verbatim rather than cherry-picking a few fields:
+/// dropping `flow`, `encryption`, `fp` or XHTTP's `extra` still completes a
+/// handshake, which is exactly what makes those bugs look like a DPI block
+/// instead of a client-side omission.
+///
+/// What a phone can dial that a PoP cannot: this app's checks run over the
+/// cellular link with every socket bound by NativePlugin.kt (including UDP
+/// ones -- xraylib registers an internet.RegisterDialerController), so
+/// UDP/QUIC keys (Hysteria2) and UDP transports (mKCP) are fully testable
+/// here. The bot rejects those only because its residential SOCKS5 pool has
+/// no UDP ASSOCIATE, which is not a limitation of this vantage point.
 class ParsedVpnKey {
   ParsedVpnKey({
     required this.protocol,
@@ -17,21 +30,11 @@ class ParsedVpnKey {
     this.uuid,
     this.password,
     this.method,
-    this.network,
-    this.security,
-    this.sni,
-    this.fingerprint,
-    this.publicKey,
-    this.shortId,
-    this.flow,
-    this.path,
-    this.host,
-    this.serviceName,
-    this.alterId,
-    this.obfs,
-    this.obfsPassword,
-    this.allowInsecure = false,
-  });
+    this.alterId = 0,
+    this.vmessSecurity = 'auto',
+    this.name = '',
+    Map<String, String>? params,
+  }) : params = params ?? const {};
 
   final String protocol; // vless | vmess | trojan | shadowsocks | hysteria2
   final String raw;
@@ -39,25 +42,63 @@ class ParsedVpnKey {
 
   final String? address;
   final int? port;
-  final String? uuid; // vless
-  final String? password; // trojan / shadowsocks / hysteria2
+  final String? uuid; // vless / vmess
+  final String? password; // trojan / shadowsocks / hysteria2 auth
   final String? method; // shadowsocks cipher
-  final String? network; // tcp | ws | grpc | xhttp
-  final String? security; // tls | reality | none
-  final String? sni;
-  final String? fingerprint;
-  final String? publicKey; // reality pbk
-  final String? shortId; // reality sid
-  final String? flow;
-  final String? path; // ws/xhttp path
-  final String? host; // ws Host header
-  final String? serviceName; // grpc
-  final int? alterId; // vmess legacy
-  final String? obfs; // hysteria2
-  final String? obfsPassword;
-  final bool allowInsecure;
+  final int alterId; // vmess legacy
+  final String vmessSecurity; // vmess "scy"
+  final String name; // link fragment / vmess "ps", for logs
+
+  /// Everything the share link carried, decoded but otherwise untouched:
+  /// type, security, sni, fp, alpn, pbk, sid, spx, pqv, ech, flow,
+  /// encryption, path, host, serviceName, mode, authority, seed,
+  /// headerType, extra, mux... VMess links (a base64 JSON blob) are
+  /// normalized into these same keys.
+  final Map<String, String> params;
+
+  String get network => params['type']?.toLowerCase() ?? 'tcp';
+  String? get security => params['security'];
 
   bool get isSupported => unsupportedReason == null && address != null && port != null;
+}
+
+/// Schemes Xray-core cannot dial as a client at all. Reported honestly
+/// instead of being attempted and failing as something that reads like a
+/// block. (WireGuard has an Xray outbound but no share-link format to build
+/// it from -- a `wireguard://` link is not something the core can consume.)
+const _unsupportedSchemes = {
+  'tuic', 'juicity',
+  'hysteria', // v1: gone from the core, v2 is a separate scheme we do dial
+  'wireguard', 'wg', 'ssr', 'snell',
+};
+
+/// Untestable reasons travel to the bot in the job result and end up in the
+/// user's report, so they are machine codes in `code:detail` form that
+/// telegram-bot/main.py translates (see _device_check_line) -- not English
+/// prose a Russian-, Chinese- or Farsi-speaking user would be shown raw.
+const _reasonSchemeUnsupported = 'scheme_unsupported_by_core';
+const _reasonTransportRemoved = 'transport_removed_from_core';
+const _reasonMkcpRemoved = 'mkcp_header_seed_removed_from_core';
+
+/// Transports Xray-core REMOVED (PrintRemovedFeatureError in
+/// infra/conf/transport_internet.go, confirmed on the 26.3.27 build shipped
+/// in xraylib.aar): naming one fails the whole config load, so the key is
+/// untestable by any current core, not blocked. Same list as the server
+/// side's REMOVED_TRANSPORTS.
+const _removedTransports = {'h2', 'http', 'quic'};
+
+/// mKCP's obfuscation parameters went the same way in this core: KCPConfig
+/// .Build() errors out with "The feature mkcp header & seed has been removed
+/// and migrated to finalmask/udp header-* & mkcp-original & mkcp-aes128gcm"
+/// as soon as `header` or `seed` is present (verified against the 26.3.27
+/// binary). A key carrying them describes a channel this core can no longer
+/// speak, and dialing it without them would hand the user a confident
+/// "doesn't work" for a key a v2rayN build still dials fine -- so it is
+/// reported as untestable instead. Plain `type=kcp` with no obfuscation is
+/// still built and dialed normally.
+bool _usesRemovedMkcpFeatures(Map<String, String> p) {
+  final header = (p['headerType'] ?? '').toLowerCase();
+  return (p['seed'] ?? '').isNotEmpty || (header.isNotEmpty && header != 'none');
 }
 
 ParsedVpnKey? parseVpnUri(String uri) {
@@ -65,130 +106,186 @@ ParsedVpnKey? parseVpnUri(String uri) {
   if (schemeMatch == null) return null;
   final scheme = schemeMatch.group(1)!.toLowerCase();
 
+  if (_unsupportedSchemes.contains(scheme)) {
+    return ParsedVpnKey(
+      protocol: scheme,
+      raw: uri,
+      unsupportedReason: '$_reasonSchemeUnsupported:$scheme',
+    );
+  }
+
   try {
+    final ParsedVpnKey key;
     switch (scheme) {
       case 'vless':
-        return _parseVless(uri);
+        key = _parseVless(uri);
+        break;
       case 'trojan':
-        return _parseTrojan(uri);
+        key = _parseTrojan(uri);
+        break;
       case 'vmess':
-        return _parseVmess(uri);
+        key = _parseVmess(uri);
+        break;
       case 'ss':
       case 'shadowsocks':
-        return _parseShadowsocks(uri);
+        key = _parseShadowsocks(uri);
+        break;
       case 'hysteria2':
       case 'hy2':
-        return _parseHysteria2(uri);
+        key = _parseHysteria2(uri);
+        break;
       default:
         return null;
     }
+    final transport = key.network;
+    if (_removedTransports.contains(transport)) {
+      return ParsedVpnKey(
+        protocol: key.protocol,
+        raw: uri,
+        unsupportedReason: '$_reasonTransportRemoved:$transport',
+      );
+    }
+    if ((transport == 'kcp' || transport == 'mkcp') && _usesRemovedMkcpFeatures(key.params)) {
+      return ParsedVpnKey(
+        protocol: key.protocol,
+        raw: uri,
+        unsupportedReason: '$_reasonMkcpRemoved:$transport',
+      );
+    }
+    return key;
   } catch (e) {
-    return ParsedVpnKey(protocol: scheme, raw: uri, unsupportedReason: 'parse_error: $e');
+    return ParsedVpnKey(protocol: scheme, raw: uri, unsupportedReason: 'parse_error:$e');
   }
 }
 
-Map<String, String> _queryParams(Uri u) => u.queryParameters;
+/// A link's query string, decoded. Kept whole so build_xray_config.dart can
+/// honor fields this parser has no named slot for.
+Map<String, String> _queryParams(Uri u) => Map<String, String>.from(u.queryParameters);
+
+/// The `#name` tag. A fragment truncated mid-escape (Telegram's 256-char
+/// inline cap does this) leaves a literal '%' behind and decodes to
+/// garbage -- fall back to the host, exactly like parse_vpn_uri does.
+String _linkName(Uri u, String host) {
+  if (u.fragment.isEmpty) return host;
+  try {
+    final decoded = Uri.decodeComponent(u.fragment);
+    return decoded.contains('%') ? host : decoded;
+  } catch (_) {
+    return host;
+  }
+}
 
 ParsedVpnKey _parseVless(String raw) {
   final u = Uri.parse(raw);
-  final q = _queryParams(u);
   return ParsedVpnKey(
     protocol: 'vless',
     raw: raw,
-    uuid: u.userInfo,
+    uuid: Uri.decodeComponent(u.userInfo),
     address: u.host,
     port: u.hasPort ? u.port : 443,
-    network: q['type'] ?? 'tcp',
-    security: q['security'] ?? 'none',
-    sni: q['sni'],
-    fingerprint: q['fp'],
-    publicKey: q['pbk'],
-    shortId: q['sid'],
-    flow: q['flow'],
-    path: q['path'],
-    host: q['host'],
-    serviceName: q['serviceName'],
-    allowInsecure: q['allowInsecure'] == '1' || q['allowInsecure'] == 'true',
+    name: _linkName(u, u.host),
+    params: _queryParams(u),
   );
 }
 
 ParsedVpnKey _parseTrojan(String raw) {
   final u = Uri.parse(raw);
-  final q = _queryParams(u);
   return ParsedVpnKey(
     protocol: 'trojan',
     raw: raw,
-    password: u.userInfo,
+    password: Uri.decodeComponent(u.userInfo),
     address: u.host,
     port: u.hasPort ? u.port : 443,
-    network: q['type'] ?? 'tcp',
-    security: q['security'] ?? 'tls',
-    sni: q['sni'],
-    fingerprint: q['fp'],
-    path: q['path'],
-    host: q['host'],
-    serviceName: q['serviceName'],
-    allowInsecure: q['allowInsecure'] == '1' || q['allowInsecure'] == 'true',
+    name: _linkName(u, u.host),
+    params: _queryParams(u),
   );
 }
 
+/// vmess://BASE64({v,ps,add,port,id,aid,scy,net,type,host,path,tls,sni,alpn,fp}),
+/// the v2rayN convention. Flattened into the same param names the
+/// query-string protocols use so the config builder has one code path.
 ParsedVpnKey _parseVmess(String raw) {
-  final b64 = raw.substring('vmess://'.length);
-  final jsonStr = utf8.decode(base64.decode(base64.normalize(b64)));
-  final j = jsonDecode(jsonStr) as Map<String, dynamic>;
-  final net = (j['net'] as String?) ?? 'tcp';
-  final tls = (j['tls'] as String?) ?? '';
+  final j = jsonDecode(utf8.decode(_b64Bytes(raw.substring('vmess://'.length))))
+      as Map<String, dynamic>;
+  String s(Object? v) => (v ?? '').toString();
+
+  final host = s(j['add']);
+  // v2rayN writes "tls" for TLS and "" for plaintext, but some exporters
+  // write the literal "none" -- a truthiness check reads that as TLS and
+  // wraps a plaintext key in a handshake its server never answers.
+  final tlsField = s(j['tls']).toLowerCase();
+  final params = <String, String>{
+    'type': s(j['net']).isEmpty ? 'tcp' : s(j['net']),
+    'headerType': s(j['type']).isEmpty ? 'none' : s(j['type']),
+    'path': s(j['path']),
+    'host': s(j['host']),
+    'sni': s(j['sni']).isNotEmpty ? s(j['sni']) : s(j['host']),
+    'security': (tlsField == 'tls' || tlsField == 'true' || tlsField == '1') ? 'tls' : 'none',
+    'alpn': s(j['alpn']),
+    // uTLS fingerprint: every real client carries it, and dropping it tests
+    // the key with Go's default ClientHello -- a fingerprint DPI singles out.
+    'fp': s(j['fp']),
+    // vmess grpc links reuse "path" for the gRPC serviceName.
+    'serviceName': s(j['path']),
+  }..removeWhere((_, v) => v.isEmpty);
+
   return ParsedVpnKey(
     protocol: 'vmess',
     raw: raw,
-    uuid: j['id'] as String?,
-    address: j['add'] as String?,
-    port: int.tryParse(j['port'].toString()),
-    network: net,
-    security: tls == 'tls' ? 'tls' : 'none',
-    sni: (j['sni'] as String?) ?? (j['host'] as String?),
-    path: j['path'] as String?,
-    host: j['host'] as String?,
-    serviceName: net == 'grpc' ? (j['path'] as String?) : null,
-    alterId: int.tryParse((j['aid'] ?? '0').toString()) ?? 0,
+    uuid: s(j['id']),
+    address: host,
+    port: int.tryParse(s(j['port'])) ?? 443,
+    alterId: int.tryParse(s(j['aid'])) ?? 0,
+    vmessSecurity: s(j['scy']).isEmpty ? 'auto' : s(j['scy']),
+    name: s(j['ps']).isEmpty ? host : s(j['ps']),
+    params: params,
   );
 }
 
+/// ss://BASE64(method:password)@host:port?params#tag and the legacy
+/// ss://BASE64(method:password@host:port) form. SS rides the shared
+/// transport layer too (ss over ws/tls exists in the wild), so query params
+/// are carried through rather than assuming bare TCP.
 ParsedVpnKey _parseShadowsocks(String raw) {
   final body = raw.substring(raw.indexOf('://') + 3);
   final hashIdx = body.indexOf('#');
-  final withoutTag = hashIdx >= 0 ? body.substring(0, hashIdx) : body;
+  final tag = hashIdx >= 0 ? body.substring(hashIdx + 1) : '';
+  var withoutTag = hashIdx >= 0 ? body.substring(0, hashIdx) : body;
+
+  String query = '';
+  final qIdx = withoutTag.indexOf('?');
+  if (qIdx >= 0) {
+    query = withoutTag.substring(qIdx + 1);
+    withoutTag = withoutTag.substring(0, qIdx);
+  }
 
   String userInfo;
   String hostPort;
   if (withoutTag.contains('@')) {
     final at = withoutTag.lastIndexOf('@');
-    userInfo = withoutTag.substring(0, at);
+    userInfo = Uri.decodeComponent(withoutTag.substring(0, at));
     hostPort = withoutTag.substring(at + 1);
-    if (!_looksBase64Decodable(userInfo)) {
-      // some generators leave method:password in plaintext before '@'
-    } else {
-      try {
-        userInfo = utf8.decode(base64.decode(base64.normalize(userInfo)));
-      } catch (_) {
-        // fall through with the raw (already plaintext) userInfo
-      }
+    if (!userInfo.contains(':')) {
+      // SIP002: the userinfo is base64(method:password).
+      userInfo = utf8.decode(_b64Bytes(userInfo));
     }
   } else {
-    // Legacy form: ss://base64(method:password@host:port)
-    final decoded = utf8.decode(base64.decode(base64.normalize(withoutTag)));
+    final decoded = utf8.decode(_b64Bytes(withoutTag));
     final at = decoded.lastIndexOf('@');
     userInfo = decoded.substring(0, at);
     hostPort = decoded.substring(at + 1);
   }
 
   final colon = userInfo.indexOf(':');
-  final method = userInfo.substring(0, colon);
-  final password = userInfo.substring(colon + 1);
+  final method = colon >= 0 ? userInfo.substring(0, colon) : 'aes-256-gcm';
+  final password = colon >= 0 ? userInfo.substring(colon + 1) : userInfo;
+
+  // IPv6 literals arrive as [::1]:443.
   final portColon = hostPort.lastIndexOf(':');
-  final host = hostPort.substring(0, portColon);
+  final host = hostPort.substring(0, portColon).replaceAll(RegExp(r'^\[|\]$'), '');
   final port = int.tryParse(hostPort.substring(portColon + 1));
 
+  final params = query.isEmpty ? <String, String>{} : Uri.splitQueryString(query);
   return ParsedVpnKey(
     protocol: 'shadowsocks',
     raw: raw,
@@ -196,32 +293,31 @@ ParsedVpnKey _parseShadowsocks(String raw) {
     password: password,
     address: host,
     port: port,
-    network: 'tcp',
-    security: 'none',
+    name: tag.isEmpty ? host : Uri.decodeComponent(tag),
+    params: Map<String, String>.from(params),
   );
-}
-
-bool _looksBase64Decodable(String s) {
-  try {
-    base64.decode(base64.normalize(s));
-    return true;
-  } catch (_) {
-    return false;
-  }
 }
 
 ParsedVpnKey _parseHysteria2(String raw) {
-  final u = Uri.parse(raw.replaceFirst('hy2://', 'hysteria2://'));
-  final q = _queryParams(u);
+  final u = Uri.parse(raw.replaceFirst(RegExp(r'^hy2://', caseSensitive: false), 'hysteria2://'));
   return ParsedVpnKey(
     protocol: 'hysteria2',
     raw: raw,
-    password: u.userInfo,
+    // The whole userinfo is the auth string: Hysteria2 allows "user:pass"
+    // there and it is passed to the server verbatim, so splitting on ':'
+    // would send half a credential.
+    password: Uri.decodeComponent(u.userInfo),
     address: u.host,
     port: u.hasPort ? u.port : 443,
-    sni: q['sni'],
-    obfs: q['obfs'],
-    obfsPassword: q['obfs-password'],
-    allowInsecure: q['insecure'] == '1' || q['insecure'] == 'true',
+    name: _linkName(u, u.host),
+    params: _queryParams(u),
   );
+}
+
+/// Decodes either base64 alphabet, padded or not. Share links use both: the
+/// URL-safe one (-_ instead of +/) is what most subscription exporters emit
+/// and plain base64.decode rejects it outright.
+List<int> _b64Bytes(String blob) {
+  final normalized = blob.replaceAll('-', '+').replaceAll('_', '/').trim();
+  return base64.decode(base64.normalize(normalized));
 }

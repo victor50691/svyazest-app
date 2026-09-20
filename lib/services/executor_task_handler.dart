@@ -5,6 +5,7 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 import 'api_client.dart';
 import 'checkers/ip_checker.dart';
+import 'checkers/subnet_checker.dart';
 import 'checkers/vpn_checker.dart';
 import 'native_bridge.dart';
 
@@ -258,6 +259,13 @@ class ExecutorTaskHandler extends TaskHandler {
           final r = await checkVpnKey(job.resource, probeSites: job.probeSites, downloadUrl: job.downloadUrl);
           success = !r.untestable;
           result = r.toJson();
+        } else if (job.resourceType == 'subnet') {
+          // All 256 addresses of a /24 over the cellular link -- "is the
+          // whole range dark here, or only some hosts in it".
+          final r = await checkSubnet(job.resource);
+          success = !r.untestable;
+          result = r.toJson();
+          await _trace('job ${job.id} subnet=${r.cidr} alive=${r.alive}/${r.probed} verdict=${r.verdict}');
         } else {
           final r = await checkIpOrDomain(job.resource);
           success = true;

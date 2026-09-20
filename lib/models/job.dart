@@ -14,7 +14,7 @@ class ExecutorJob {
   final int id;
   final int checkId;
   final String resource;
-  final String resourceType; // 'vpn_key' | 'ip' | 'domain'
+  final String resourceType; // 'vpn_key' | 'ip' | 'domain' | 'subnet'
   final String? protocol; // vless/vmess/trojan/shadowsocks/hysteria2
   /// Sites to open through the key and a ~1 MB file to pull through it
   /// (server-configured; see routes/executor/index.js probeConfig).

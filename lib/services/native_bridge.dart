@@ -150,6 +150,23 @@ class NativeBridge {
     }
   }
 
+  /// Walks all 256 addresses of a /24 over the cellular link (ICMP + TCP
+  /// 443/80). Used by the subnet flavour of a БС check, where the question
+  /// is whether the operator drops the whole range or only some hosts.
+  static Future<Map<String, dynamic>> subnetProbe(String cidr,
+      {int timeoutMs = 1200, int concurrency = 32}) async {
+    try {
+      final raw = await _channel.invokeMethod<Object>('subnetProbe', {
+        'cidr': cidr,
+        'timeoutMs': timeoutMs,
+        'concurrency': concurrency,
+      });
+      return Map<String, dynamic>.from(_plain(raw) as Map);
+    } catch (e) {
+      return {'cidr': cidr, 'error': e.toString()};
+    }
+  }
+
   /// Platform-channel maps come back as Map<Object?, Object?>; jsonEncode
   /// needs String keys all the way down.
   static Object? _plain(Object? v) {

@@ -532,6 +532,7 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
             const VpnBypassClientsSection(header: 'Инструкция для вашего VPN-клиента'),
             const SizedBox(height: 20),
           ],
+          ..._partnerSection(),
           GroupedSection(
             header: 'Сеть',
             children: [
@@ -576,6 +577,59 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
         ],
       ),
     );
+  }
+
+  /// Which operator and region this partner is signed up as -- the thing
+  /// that decides which jobs reach this phone at all. While the application
+  /// is on moderation the values come from the application itself (nothing
+  /// is approved yet); once approved, the approved ones are shown, and a
+  /// pending change is noted underneath instead of replacing them, because
+  /// the work still runs on the old data until it is reviewed.
+  List<Widget> _partnerSection() {
+    final p = _profile;
+    if (p == null || !p.hasPartnerInfo) return const [];
+    final pending = p.pendingApplication;
+    final showApplication = pending != null && !p.isApproved;
+    final source = showApplication ? pending : null;
+
+    final operator = source?.operatorLabel ?? p.operatorLabel;
+    final region = source?.region ?? p.region;
+    final district = source?.federalDistrictLabel ?? p.federalDistrictLabel;
+    if ((operator ?? '').isEmpty && (region ?? '').isEmpty) return const [];
+
+    final rows = <Widget>[
+      GroupedRow(label: 'Оператор', value: (operator ?? '').isEmpty ? '—' : operator),
+      GroupedRow(label: 'Регион', value: (region ?? '').isEmpty ? '—' : region),
+      if ((district ?? '').isNotEmpty) GroupedRow(label: 'Федеральный округ', value: district),
+    ];
+
+    String? note;
+    if (showApplication) {
+      note = 'Эти данные вы указали в заявке — мы их проверяем. '
+          'Задания начнут приходить после одобрения.';
+    } else if (pending != null) {
+      final changed = [pending.operatorLabel, pending.region]
+          .where((v) => (v ?? '').isNotEmpty)
+          .join(', ');
+      note = 'На модерации новые данные${changed.isEmpty ? '' : ': $changed'}. '
+          'Пока заявку не одобрят, задания приходят по текущим.';
+    }
+
+    return [
+      GroupedSection(
+        header: showApplication ? 'Заявка на модерации' : 'Партнёр',
+        children: rows,
+      ),
+      if (note != null)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+          child: Text(
+            note,
+            style: const TextStyle(fontSize: 13, height: 1.45, color: AppColors.textSecondary),
+          ),
+        ),
+      const SizedBox(height: 20),
+    ];
   }
 
   /// The big word. The switch can be on while the service is only waiting
