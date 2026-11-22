@@ -9,6 +9,8 @@ class ExecutorJob {
     this.downloadUrl,
     this.whitelistAllowed = const [],
     this.whitelistControl = const [],
+    this.needsCore,
+    this.ipFamily,
   });
 
   final int id;
@@ -24,6 +26,13 @@ class ExecutorJob {
   /// the mobile whitelist mode, and neutral hosts that must not.
   final List<String> whitelistAllowed;
   final List<String> whitelistControl;
+  /// 'next' = the key needs Xray-core 26.10 (server: executor_jobs.needs_core).
+  final String? needsCore;
+  /// IP/domain jobs (1.17.2): 6 = the customer asked for the check over IPv6
+  /// (an IPv6 address, or a domain by its AAAA), 4 = over IPv4 only, null =
+  /// as before. The server hands 6 only to phones that reported IPv6 on
+  /// their mobile network.
+  final int? ipFamily;
 
   factory ExecutorJob.fromJson(Map<String, dynamic> json) => ExecutorJob(
         id: json['id'] as int,
@@ -35,6 +44,8 @@ class ExecutorJob {
         downloadUrl: json['download_url'] as String?,
         whitelistAllowed: (json['whitelist_allowed'] as List?)?.map((e) => e.toString()).toList() ?? const [],
         whitelistControl: (json['whitelist_control'] as List?)?.map((e) => e.toString()).toList() ?? const [],
+        needsCore: json['needs_core'] as String?,
+        ipFamily: (json['ip_family'] as num?)?.toInt(),
       );
 }
 

@@ -87,4 +87,8 @@ dependencies {
     // (see xraylib/build.sh); replaces the old exec'd libxray.so binary.
     implementation(files("libs/xraylib.aar"))
     implementation("androidx.core:core-ktx:1.13.1")
+    // GPS check (GpsPlugin.kt, 1.13.0): Google fused location + the one-tap
+    // «turn on location accuracy» dialog. Phones without Google services
+    // fall back to LocationManager only.
+    implementation("com.google.android.gms:play-services-location:21.3.0")
 }

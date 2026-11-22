@@ -10,11 +10,22 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- One-time GPS check, only after the partner agrees to support's
+         request (GpsPlugin.kt); never in the background. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Anti-spoofing: find apps that can act as the mock location provider
+         and whether one is selected (GpsPlugin.environment). -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- In-app update (1.19.0): hand the downloaded APK to the system installer. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
+        android:allowBackup="false"
+        android:fullBackupContent="false"
         android:label="Связь Есть?"
         android:name=".App"
         android:icon="@mipmap/ic_launcher"
@@ -23,6 +34,7 @@
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
+            android:screenOrientation="portrait"
             android:taskAffinity=""
             android:theme="@style/LaunchTheme"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
@@ -42,12 +54,32 @@
             </intent-filter>
         </activity>
 
+        <!-- Buttons / swipe of the «Разрешить сбор логов?» notification
+             (DiagNotifier.kt). Only this app sends these intents. -->
+        <receiver
+            android:name=".DiagReceiver"
+            android:exported="false" />
+        <receiver
+            android:name=".GpsReceiver"
+            android:exported="false" />
+
         <!-- flutter_foreground_task's service; name/exported must not change. -->
         <service
             android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
             android:foregroundServiceType="dataSync"
             android:exported="false"
             android:stopWithTask="false" />
+
+        <!-- In-app update (1.19.0): the downloaded APK (cache/updates/) for the installer. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.updates"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_paths" />
+        </provider>
 
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->

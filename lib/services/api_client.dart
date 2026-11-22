@@ -2,6 +2,8 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
 
+import 'control_http.dart';
+
 import '../models/job.dart';
 import '../models/profile.dart';
 import 'native_bridge.dart';
@@ -23,7 +25,13 @@ class HeartbeatReply {
     this.whitelistControl = const [],
     this.whitelistInterval = const Duration(minutes: 5),
     this.whitelistRequired = true,
+    this.diag,
+    this.gps,
+    this.attestDue = false,
   });
+
+  /// The hardware-bound key is due for its daily re-attestation (1.16.0).
+  final bool attestDue;
 
   /// Hosts that stay reachable under a whitelist, and neutral ones that do
   /// not -- the verdict is the comparison between them.
@@ -34,6 +42,12 @@ class HeartbeatReply {
   /// Whether the server refuses jobs to phones outside whitelist mode
   /// (admin-configurable). Only affects what the app tells the user.
   final bool whitelistRequired;
+
+  /// Support's log request, if any (services/diag_log.dart).
+  final DiagInfo? diag;
+
+  /// Support's GPS check request, if any (services/gps_check.dart).
+  final GpsInfo? gps;
 
   bool get canProbe => whitelistAllowed.isNotEmpty && whitelistControl.isNotEmpty;
 }
@@ -79,7 +93,10 @@ class AuthPoll {
 }
 
 class ApiClient {
-  ApiClient({http.Client? client}) : _client = client ?? http.Client();
+  // 1.11.0: requests to our server take their own route (VPN / Wi-Fi /
+  // the VPN client's proxy / cellular), see control_http.dart; the checks
+  // stay on the bare cellular network.
+  ApiClient({http.Client? client}) : _client = client ?? ControlHttpClient();
   final http.Client _client;
 
   Uri _u(String path) => Uri.parse('$apiBaseUrl$path');
@@ -190,6 +207,8 @@ class ApiClient {
     String? country,
     String? simCountry,
     String? whitelistVerdict,
+    bool? ipv6,
+    bool? rooted,
   }) async {
     final token = await SecureStore.getDeviceToken();
     if (token == null) return const HeartbeatReply();
@@ -205,6 +224,14 @@ class ApiClient {
             'country': ?country,
             'sim_country': ?simCountry,
             'whitelist_verdict': ?whitelistVerdict,
+            // 1.17.2: whether the mobile network carries IPv6 right now
+            // (measured every few minutes) -- only such phones are given
+            // IPv6 checks of addresses / domains.
+            'ipv6': ?ipv6,
+            // 1.18.0: root found on the device. The server gives such a
+            // phone jobs only if the admin made an exception for the
+            // partner (executors.integrity_exempt).
+            'rooted': ?rooted,
           }),
         )
         .timeout(const Duration(seconds: 15));
@@ -214,6 +241,9 @@ class ApiClient {
       whitelistControl: (body['whitelist_control'] as List?)?.map((e) => e.toString()).toList() ?? const [],
       whitelistInterval: Duration(seconds: (body['whitelist_interval'] as num?)?.toInt() ?? 300),
       whitelistRequired: body['whitelist_required'] != false,
+      diag: DiagInfo.fromJson(body['diag']),
+      gps: GpsInfo.fromJson(body['gps']),
+      attestDue: body['attest_due'] == true,
     );
   }
 
@@ -264,6 +294,57 @@ class ApiClient {
     _decode(resp);
   }
 
+  /// The partner's answer to support's log request; returns its status now.
+  Future<String> diagDecision(int id, bool accept) async {
+    final token = await SecureStore.getDeviceToken();
+    if (token == null) throw ApiException(401, 'Not paired');
+    final resp = await _client
+        .post(_u('/diag/$id/decision'), headers: _jsonHeaders(token), body: jsonEncode({'accept': accept}))
+        .timeout(const Duration(seconds: 15));
+    return (_decode(resp)['status'] ?? '').toString();
+  }
+
+  /// The partner's answer to the GPS check request; returns its status now.
+  Future<String> gpsDecision(int id, bool accept) async {
+    final token = await SecureStore.getDeviceToken();
+    if (token == null) throw ApiException(401, 'Not paired');
+    final resp = await _client
+        .post(_u('/gps/$id/decision'), headers: _jsonHeaders(token), body: jsonEncode({'accept': accept}))
+        .timeout(const Duration(seconds: 15));
+    return (_decode(resp)['status'] ?? '').toString();
+  }
+
+  /// The one fix (or why there is none) for the GPS check.
+  Future<void> gpsResult(int id, Map<String, dynamic> data) async {
+    final token = await SecureStore.getDeviceToken();
+    if (token == null) throw ApiException(401, 'Not paired');
+    final resp = await _client
+        .post(_u('/gps/$id/result'), headers: _jsonHeaders(token), body: jsonEncode(data))
+        .timeout(const Duration(seconds: 20));
+    _decode(resp);
+  }
+
+  /// Настройки → «Остановить сбор логов».
+  Future<void> diagStop(int id) async {
+    final token = await SecureStore.getDeviceToken();
+    if (token == null) throw ApiException(401, 'Not paired');
+    final resp = await _client
+        .post(_u('/diag/$id/stop'), headers: _jsonHeaders(token), body: '{}')
+        .timeout(const Duration(seconds: 15));
+    _decode(resp);
+  }
+
+  /// One batch of the diagnostics log; false = the request is no longer
+  /// accepted (stopped by support or the partner) -- stop collecting.
+  Future<bool> diagLogs(int id, List<Map<String, dynamic>> lines) async {
+    final token = await SecureStore.getDeviceToken();
+    if (token == null) return false;
+    final resp = await _client
+        .post(_u('/diag/$id/logs'), headers: _jsonHeaders(token), body: jsonEncode({'lines': lines}))
+        .timeout(const Duration(seconds: 20));
+    return _decode(resp)['active'] != false;
+  }
+
   /// Diagnostics: last background-loop error, stored on the device row.
   Future<void> reportError(String message) async {
     final token = await SecureStore.getDeviceToken();
@@ -290,7 +371,8 @@ class ApiClient {
         .post(
           _u('/attest/verify'),
           headers: _jsonHeaders(token),
-          body: jsonEncode({'chain': ?chain, 'client_error': ?clientError}),
+          // 1.16.0: keep the attested key and bind it (job requests are signed with it).
+          body: jsonEncode({'chain': ?chain, 'client_error': ?clientError, 'bind': chain != null}),
         )
         .timeout(const Duration(seconds: 30));
     return (_decode(resp)['status'] as String?) ?? 'error';
@@ -313,6 +395,18 @@ class ApiClient {
       'sim_country': cc.sim,
       'vpn_active': await NativeBridge.hasActiveVpn(),
     };
+    // 1.17.1: both public addresses of the mobile network, each asked of
+    // Yandex's single-stack echo over cellular -- the request to us below
+    // shows only one of them (IPv6 when the operator gives one, while the
+    // moderator wants the IPv4 first).
+    final both = await Future.wait([cellularEcho(4), cellularEcho(6)]);
+    if (both[0].ip != null) payload['ipv4'] = both[0].ip;
+    if (both[1].ip != null) payload['ipv6'] = both[1].ip;
+    final ipErr = [
+      if (both[0].error != null) 'ipv4: ${both[0].error}',
+      if (both[1].error != null) 'ipv6: ${both[1].error}',
+    ];
+    if (ipErr.isNotEmpty) payload['ip_error'] = ipErr.join('; ');
     final url = _u('/network-report').toString();
     final cell = await NativeBridge.cellularPost(url, jsonEncode({...payload, 'via': 'cellular'}), token: token);
     if (cell.status != 0) return cell.ok; // reached the server over cellular
@@ -323,6 +417,43 @@ class ApiClient {
           .timeout(const Duration(seconds: 15));
     } catch (_) {}
     return false;
+  }
+
+  /// The operator's IPv4 (family 4) or IPv6 (6) over cellular via
+  /// ipv4-internet / ipv6-internet.yandex.net (they answer the real address
+  /// only to browser-like requests, see cellular_ip.dart). No IPv6 from the
+  /// operator = a connect error, reported as such.
+  static Future<({String? ip, String? error})> cellularEcho(int family) async {
+    final r = await NativeBridge.cellularGet('https://ipv$family-internet.yandex.net/api/v0/ip', headers: const {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36',
+      'Origin': 'https://yandex.ru',
+      'Referer': 'https://yandex.ru/internet/',
+    });
+    if (!r.ok) return (ip: null, error: r.status != 0 ? 'HTTP ${r.status}' : (r.error ?? 'нет ответа'));
+    try {
+      final v = jsonDecode(r.body.trim());
+      if (v is String && v.isNotEmpty && v != '127.0.0.1' && (family == 4 ? !v.contains(':') : v.contains(':'))) {
+        return (ip: v, error: null);
+      }
+    } catch (_) {}
+    final b = r.body.trim();
+    return (ip: null, error: 'ответ ${b.length > 60 ? b.substring(0, 60) : b}');
+  }
+
+  /// In-app update (1.19.0): the version the server hands out --
+  /// {version, available, size, sha256}; null without a token.
+  Future<Map<String, dynamic>?> appLatest() async {
+    final token = await SecureStore.getDeviceToken();
+    if (token == null) return null;
+    final resp = await _client.get(_u('/app/latest'), headers: _jsonHeaders(token)).timeout(const Duration(seconds: 20));
+    return _decode(resp);
+  }
+
+  /// Headers for the native APK download (same auth as every request).
+  Future<Map<String, String>?> authHeaders() async {
+    final token = await SecureStore.getDeviceToken();
+    if (token == null) return null;
+    return _jsonHeaders(token);
   }
 
   Future<ExecutorProfile> profile() async {

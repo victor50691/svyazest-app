@@ -41,6 +41,32 @@ class SecureStore {
 
   static Future<bool> isPaired() async => (await getDeviceToken()) != null;
 
+  /// The server's last answer to «may this rooted device work» (1.18.0),
+  /// for a start without network.
+  /// Kept in the foreground task's store too: the service isolate reads it
+  /// there when secure storage is not available to it (like the token).
+  static const _keyRootExempt = 'root_exempt';
+  static Future<void> setRootExempt(bool v) async {
+    try {
+      await _storage.write(key: _keyRootExempt, value: v ? '1' : '0');
+    } catch (_) {}
+    try {
+      await FlutterForegroundTask.saveData(key: _keyRootExempt, value: v);
+    } catch (_) {}
+  }
+
+  static Future<bool> getRootExempt() async {
+    try {
+      final v = await _storage.read(key: _keyRootExempt);
+      if (v != null) return v == '1';
+    } catch (_) {}
+    try {
+      return await FlutterForegroundTask.getData<bool>(key: _keyRootExempt) ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   static Future<void> clear() async {
     await _storage.delete(key: _keyDeviceToken);
     await _storage.delete(key: _keyExecutorId);

@@ -133,17 +133,20 @@ class VpnBypassGuideScreen extends StatelessWidget {
     final steps = client._steps;
     return Scaffold(
       appBar: AppBar(
+        // «Другое» has no logo of its own -- just the title, no stand-in icon.
         title: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            VpnClientLogo(client, size: 24),
-            const SizedBox(width: 10),
+            if (client.logo != null) ...[VpnClientLogo(client, size: 24), const SizedBox(width: 10)],
             Text(client.title),
           ],
         ),
       ),
       body: ListView.separated(
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
+        // targetSdk 36 draws edge-to-edge: the list runs under the system
+        // navigation bar, and an explicit padding drops its inset -- without
+        // it the end of the last step stayed hidden under the bar.
+        padding: EdgeInsets.fromLTRB(16, 8, 16, 32 + MediaQuery.paddingOf(context).bottom),
         itemCount: steps.length + 1,
         separatorBuilder: (_, _) => const SizedBox(height: 20),
         itemBuilder: (context, i) {
@@ -212,6 +215,55 @@ class _StepCard extends StatelessWidget {
                 child: Image.asset(step.image!, fit: BoxFit.fitWidth, width: double.infinity),
               ),
             ),
+        ],
+      ),
+    );
+  }
+}
+
+/// «Работа с включённым VPN» (1.11.0): why the app must go around the VPN,
+/// the one step for the partner, and how the link to the server works under
+/// «белые списки» (services/control_http.dart, ControlChannel.kt).
+class VpnWorkGuideScreen extends StatelessWidget {
+  const VpnWorkGuideScreen({super.key});
+
+  static const _p = TextStyle(fontSize: 15, height: 1.45);
+  static const _h = TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.textSecondary, letterSpacing: .3);
+
+  Widget _card(String text) => Material(
+        color: AppColors.group,
+        borderRadius: BorderRadius.circular(12),
+        child: Padding(padding: const EdgeInsets.fromLTRB(16, 14, 16, 14), child: Text(text, style: _p)),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Работа с включённым VPN')),
+      body: ListView(
+        padding: EdgeInsets.fromLTRB(16, 8, 16, 32 + MediaQuery.paddingOf(context).bottom),
+        children: [
+          _card('VPN выключать не нужно — пользуйтесь интернетом как обычно. '
+              'Нужно только, чтобы сами проверки «Связь Есть?» шли через мобильную сеть напрямую, мимо VPN: '
+              'иначе приложение проверяло бы ваш VPN, а не мобильного оператора. Все остальные приложения '
+              'на телефоне продолжат работать через VPN.'),
+          const SizedBox(height: 20),
+          const Padding(padding: EdgeInsets.only(left: 16, bottom: 8), child: Text('ШАГ 1. ДОБАВЬТЕ ПРИЛОЖЕНИЕ В ИСКЛЮЧЕНИЯ VPN', style: _h)),
+          _card('В настройках вашего VPN-клиента отметьте «Связь Есть?» в списке приложений, которые идут мимо VPN '
+              '(«Обход», «Исключения», «Раздельное туннелирование», «Per-app proxy»). Пошаговые инструкции:'),
+          const SizedBox(height: 8),
+          const VpnBypassClientsSection(),
+          const SizedBox(height: 20),
+          const Padding(padding: EdgeInsets.only(left: 16, bottom: 8), child: Text('ШАГ 2. ОБЫЧНО НИЧЕГО ДЕЛАТЬ НЕ НУЖНО', style: _h)),
+          _card('Со своим сервером приложение связывается само и выбирает путь, который работает: через Wi-Fi, '
+              'через VPN или через прокси вашего VPN-клиента. Какой путь используется сейчас, видно в '
+              '«Настройки → Связь с сервером».\n\n'
+              'Когда на мобильной сети включены белые списки и Wi-Fi нет, до сервера можно достучаться только через '
+              'прокси VPN-клиента. В большинстве клиентов он уже работает сам (v2rayNG, Hiddify, NekoBox и другие) — '
+              'приложение найдёт его автоматически.\n\n'
+              'Если в «Связь с сервером» написано «нет связи»: откройте настройки VPN-клиента, найдите «Локальный прокси», '
+              '«SOCKS5», «Порт SOCKS» или «Mixed port», включите его и посмотрите номер порта. Если порт необычный, '
+              'впишите его в «Настройки → Связь с сервером → Порт прокси».'),
         ],
       ),
     );

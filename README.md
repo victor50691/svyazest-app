@@ -3,7 +3,7 @@
 [![Build APK](https://github.com/victor50691/svyazest-app/actions/workflows/build.yml/badge.svg)](https://github.com/victor50691/svyazest-app/actions/workflows/build.yml)
 
 Android-приложение для сети [DPI//Checker](https://t.me/dpi_checker_robot):
-превращает ваш телефон в «исполнителя», который выполняет короткие проверки
+превращает ваш телефон в «партнёра», который выполняет короткие проверки
 доступности VPN-ключей (VLESS / VMESS / TROJAN / SHADOWSOCKS / HYSTERIA2) и
 IP-адресов/доменов прямо со своих мобильных данных, и получает за это
 вознаграждение на баланс в Telegram-боте [@svyaz_estt_bot](https://t.me/svyaz_estt_bot).

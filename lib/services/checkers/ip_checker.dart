@@ -27,6 +27,10 @@ class IpCheckResult {
     this.payloadUrl,
     this.payloadFrom,
     this.stallBytes,
+    this.antiBot,
+    this.redirects,
+    this.redirectLimit,
+    this.ipFamily,
   });
 
   final bool accessible;
@@ -52,6 +56,17 @@ class IpCheckResult {
   final String? payloadUrl;
   final String? payloadFrom; // page | asset
   final int? stallBytes; // bytes received before the flow was cut
+  /// Captcha / DDoS protection that answered instead of the page
+  /// (ddos-guard, cloudflare, qrator, stormwall, variti, servicepipe,
+  /// yandex-captcha, captcha). The site was reached; null = none seen.
+  final String? antiBot;
+  final int? redirects;
+  /// The site kept redirecting past [_maxRedirects] hops.
+  final bool? redirectLimit;
+  /// 4 / 6 = every connection of the check went over that IP family only
+  /// (job field ip_family, 1.17.2); null = whatever the system picked, as
+  /// before.
+  final int? ipFamily;
 
   Map<String, dynamic> toJson() => {
         'accessible': accessible,
@@ -72,12 +87,62 @@ class IpCheckResult {
         'payload_url': payloadUrl,
         'payload_from': payloadFrom,
         'stall_bytes': stallBytes,
+        'anti_bot': antiBot,
+        'redirects': redirects,
+        'redirect_limit': redirectLimit,
+        'ip_family': ipFamily,
       };
 }
 
-Future<IpCheckResult> checkIpOrDomain(String target) async {
-  if (_asLiteralIp(target) == null) return _checkDomain(target);
-  return _checkIp(target);
+/// [ipFamily] (job field ip_family, 1.17.2): 6 = resolve the domain's AAAA
+/// over the mobile network and connect only over IPv6, 4 = only over IPv4,
+/// null = as before (A records for the verdict, the connection itself goes
+/// wherever the system sends it). A literal address is its own family.
+Future<IpCheckResult> checkIpOrDomain(String target, {int? ipFamily}) async {
+  final literal = _asLiteralIp(target);
+  if (literal == null) return _checkDomain(target, ipFamily: ipFamily == 6 || ipFamily == 4 ? ipFamily : null);
+  return _checkIp(literal);
+}
+
+/// The address family a job asks for, as dart:io's type.
+InternetAddressType _familyType(int family) =>
+    family == 6 ? InternetAddressType.IPv6 : InternetAddressType.IPv4;
+
+/// Addresses of [host] in [family] only, from the network the process is
+/// bound to (the cellular one). NAT64 answers (64:ff9b::/96, synthesized by
+/// a DNS64 resolver for an IPv4-only site) are not the site's own IPv6 and
+/// do not count.
+Future<List<InternetAddress>> _lookupFamily(String host, int family) async {
+  final literal = InternetAddress.tryParse(host);
+  if (literal != null) return literal.type == _familyType(family) ? [literal] : const [];
+  final all = await InternetAddress.lookup(host, type: _familyType(family)).timeout(const Duration(seconds: 8));
+  return all.where((a) => a.type == _familyType(family) && !(family == 6 && _isNat64(a))).toList();
+}
+
+bool _isNat64(InternetAddress a) {
+  final b = a.rawAddress;
+  return b.length == 16 && b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b &&
+      b.sublist(4, 12).every((x) => x == 0);
+}
+
+/// Every connection of [client] goes to an address of [family] only --
+/// HttpClient itself would take whatever getaddrinfo puts first (IPv6 on a
+/// dual-stack operator), which is not what an «IPv4» or «IPv6» check means.
+/// https is wrapped in TLS here with the URL's host as SNI and for the
+/// certificate check (the factory has to hand back a ready SecureSocket).
+void _pinFamily(HttpClient client, int? family) {
+  if (family == null) return;
+  client.connectionFactory = (Uri uri, String? proxyHost, int? proxyPort) async {
+    final addrs = await _lookupFamily(uri.host, family);
+    if (addrs.isEmpty) {
+      throw SocketException('no IPv$family address for the host', address: null);
+    }
+    final port = uri.hasPort ? uri.port : (uri.scheme == 'https' ? 443 : 80);
+    final task = await Socket.startConnect(addrs.first, port);
+    if (uri.scheme != 'https') return task;
+    final secured = task.socket.then((s) => SecureSocket.secure(s, host: uri.host));
+    return ConnectionTask.fromSocket(secured, task.cancel);
+  };
 }
 
 // Same numbers as the server-side «Зонд» (services/probe.py): the cutoff
@@ -87,6 +152,83 @@ const int _minPayloadBytes = 49152;
 const int _maxPayloadBytes = 800000;
 const int _stallMaxBytes = 40000;
 const int _maxAssetCandidates = 6;
+// Russian sites chain a lot of hops (www, /ru/, a cookie gate, a region
+// picker); a browser follows 20, HttpClient's default is 5.
+const int _maxRedirects = 10;
+
+/// GET [start], following redirects by hand and carrying cookies between
+/// hops the way a browser does. HttpClient's own follower drops Set-Cookie,
+/// so an anti-bot gate that sets a cookie and redirects back to the same
+/// URL looks like a loop to it (RedirectException) -- a reachable site
+/// recorded as a block. The last response is returned unread.
+Future<({HttpClientResponse resp, List<Uri> locations, bool limitHit})> _getFollowing(HttpClient client, Uri start) async {
+  final jar = <String, Cookie>{};
+  final locations = <Uri>[];
+  var at = start;
+  for (var hop = 0;; hop++) {
+    final req = await client.getUrl(at).timeout(const Duration(seconds: 10));
+    req.followRedirects = false;
+    final host = at.host.toLowerCase();
+    req.cookies.addAll(jar.values.where((c) => _cookieFor(c, host)));
+    final resp = await req.close().timeout(const Duration(seconds: 15));
+    List<Cookie> set = const [];
+    try {
+      set = resp.cookies;
+    } catch (_) {} // a malformed Set-Cookie is the site's problem, not a block
+    for (final c in set) {
+      c.domain = (c.domain ?? host).toLowerCase().replaceFirst(RegExp(r'^\.'), '');
+      jar['${c.domain}|${c.name}'] = c;
+    }
+    final loc = resp.headers.value(HttpHeaders.locationHeader);
+    Uri? next;
+    if (resp.isRedirect && loc != null) {
+      try {
+        next = at.resolveUri(Uri.parse(loc.trim()));
+      } catch (_) {}
+    }
+    if (next == null || (next.scheme != 'https' && next.scheme != 'http')) {
+      return (resp: resp, locations: locations, limitHit: false);
+    }
+    if (hop >= _maxRedirects) return (resp: resp, locations: locations, limitHit: true);
+    await resp.drain<void>().timeout(const Duration(seconds: 10));
+    locations.add(Uri.parse(loc!.trim()));
+    at = next;
+  }
+}
+
+bool _cookieFor(Cookie c, String host) {
+  final d = c.domain;
+  return d == null || host == d || host.endsWith('.$d');
+}
+
+/// Which protection answered instead of the site, if any. Only pages that
+/// look like a stop -- an error status, a captcha URL or Cloudflare's own
+/// challenge header -- count: a normal page of a protected site still
+/// carries the vendor's server header and cookies.
+String? _detectAntiBot(int? code, HttpHeaders headers, Uri finalUri, List<List<int>> body) {
+  final server = (headers.value('server') ?? '').toLowerCase();
+  final setCookie = (headers['set-cookie'] ?? const <String>[]).join(';').toLowerCase();
+  final path = finalUri.path.toLowerCase();
+  final cfChallenge = (headers.value('cf-mitigated') ?? '').toLowerCase() == 'challenge';
+  final captchaUrl = path.contains('captcha');
+  if (!cfChallenge && !captchaUrl && (code == null || code < 400)) return null;
+  final head = <int>[];
+  for (final ch in body) {
+    head.addAll(ch.length > 65536 - head.length ? ch.sublist(0, 65536 - head.length) : ch);
+    if (head.length >= 65536) break;
+  }
+  final text = String.fromCharCodes(head).toLowerCase();
+  bool any(List<String> xs) => xs.any((x) => server.contains(x) || setCookie.contains(x) || text.contains(x));
+  if (cfChallenge || (server.contains('cloudflare') && any(['challenge-platform', 'cf-chl', 'just a moment']))) return 'cloudflare';
+  if (any(['ddos-guard', '__ddg'])) return 'ddos-guard';
+  if (any(['qrator'])) return 'qrator';
+  if (any(['stormwall'])) return 'stormwall';
+  if (any(['variti'])) return 'variti';
+  if (any(['servicepipe'])) return 'servicepipe';
+  if (path.contains('showcaptcha') || any(['smartcaptcha', 'captcha.yandex'])) return 'yandex-captcha';
+  if (captchaUrl || text.contains('captcha')) return 'captcha';
+  return null;
+}
 
 final RegExp _assetRe = RegExp(r"(?:src|href)\s*=\s*[\x22\x27]([^\x22\x27#?\s]+\.(?:css|js|png|jpe?g|webp|gif|svg|woff2?|ttf|mp4|json)(?:\?[^\x22\x27\s]*)?)[\x22\x27]", caseSensitive: false);
 
@@ -168,20 +310,37 @@ String _registrable(String host) {
 /// way a browser would: honest DNS answer, valid certificate for that name
 /// (SNI), a response with content, and no redirect off to some other site.
 /// That is what a DNS spoof, a TLS reset or an ISP block page all fail.
-Future<IpCheckResult> _checkDomain(String domain) async {
+Future<IpCheckResult> _checkDomain(String domain, {int? ipFamily}) async {
   String? resolvedIp;
-  try {
-    final addresses = await InternetAddress.lookup(domain, type: InternetAddressType.IPv4).timeout(const Duration(seconds: 8));
-    if (addresses.isNotEmpty) resolvedIp = addresses.first.address;
-  } catch (_) {}
-  if (resolvedIp == null) {
-    return IpCheckResult(accessible: false, error: 'dns failed', blockReason: 'dns');
-  }
-  if (_isBogusIp(resolvedIp)) {
-    return IpCheckResult(accessible: false, resolvedIp: resolvedIp, error: 'dns poisoned', blockReason: 'dns_poisoned');
+  if (ipFamily == 6) {
+    // «Через IPv6»: the domain's own AAAA from the mobile network's DNS. None
+    // there (or only NAT64 ones) = nothing to reach over IPv6 -- told apart
+    // from a DNS failure, it is not a block.
+    try {
+      final v6 = await _lookupFamily(domain, 6);
+      if (v6.isNotEmpty) resolvedIp = v6.first.address;
+    } catch (_) {}
+    if (resolvedIp == null) {
+      return IpCheckResult(accessible: false, error: 'no AAAA', blockReason: 'no_aaaa', ipFamily: 6);
+    }
+    if (_isBogusIp6(InternetAddress(resolvedIp))) {
+      return IpCheckResult(accessible: false, resolvedIp: resolvedIp, error: 'dns poisoned', blockReason: 'dns_poisoned', ipFamily: 6);
+    }
+  } else {
+    try {
+      final addresses = await InternetAddress.lookup(domain, type: InternetAddressType.IPv4).timeout(const Duration(seconds: 8));
+      if (addresses.isNotEmpty) resolvedIp = addresses.first.address;
+    } catch (_) {}
+    if (resolvedIp == null) {
+      return IpCheckResult(accessible: false, error: 'dns failed', blockReason: 'dns', ipFamily: ipFamily);
+    }
+    if (_isBogusIp(resolvedIp)) {
+      return IpCheckResult(accessible: false, resolvedIp: resolvedIp, error: 'dns poisoned', blockReason: 'dns_poisoned', ipFamily: ipFamily);
+    }
   }
 
   final client = HttpClient();
+  _pinFamily(client, ipFamily);
   client.connectionTimeout = const Duration(seconds: 8);
   client.userAgent = 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36';
   final sw = Stopwatch()..start();
@@ -194,13 +353,16 @@ Future<IpCheckResult> _checkDomain(String domain) async {
   final bodyChunks = <List<int>>[];
   int bodyKept = 0;
   bool pageComplete = false;
+  String? antiBot;
+  bool redirectLimit = false;
+  int redirects = 0;
   try {
-    final req = await client.getUrl(Uri.https(domain, '/')).timeout(const Duration(seconds: 10));
-    req.followRedirects = true;
-    req.maxRedirects = 5;
-    final resp = await req.close().timeout(const Duration(seconds: 15));
+    final got = await _getFollowing(client, Uri.https(domain, '/'));
+    final resp = got.resp;
     code = resp.statusCode;
-    final chain = walkRedirects(domain, resp.redirects.map((r) => r.location).toList());
+    redirectLimit = got.limitHit;
+    redirects = got.locations.length;
+    final chain = walkRedirects(domain, got.locations);
     finalUri = chain.finalUri;
     final untrustedHop = chain.untrustedHop;
     finalHost = finalUri.host.isEmpty ? domain : finalUri.host;
@@ -225,6 +387,13 @@ Future<IpCheckResult> _checkDomain(String domain) async {
         (untrustedHop || (finalUri.scheme != 'https' && _registrable(finalHost) != _registrable(domain)))) {
       blockReason = 'redirect';
     }
+    // A captcha / DDoS-protection page arrived over the site's own verified
+    // TLS: the network let us through to the site, its protection stopped
+    // a robot. Reachable -- whatever the status code or page size.
+    if (blockReason == null || blockReason == 'volume') {
+      antiBot = _detectAntiBot(code, resp.headers, finalUri, bodyChunks);
+      if (antiBot != null && pageComplete) blockReason = null;
+    }
   } on HandshakeException catch (e) {
     error = e.toString();
     blockReason = 'tls';
@@ -244,7 +413,8 @@ Future<IpCheckResult> _checkDomain(String domain) async {
     sw.stop();
     client.close(force: true);
   }
-  bool ok = blockReason == null && code != null && code < 500 && bytes > 0;
+  bool ok = blockReason == null && code != null &&
+      (antiBot != null || (code < 500 && (bytes > 0 || redirectLimit)));
   final pageMs = sw.elapsedMilliseconds;
 
   // Volume test. The page itself is evidence when it is big enough and came
@@ -255,7 +425,9 @@ Future<IpCheckResult> _checkDomain(String domain) async {
   String? payloadUrl;
   String? payloadFrom;
   int? stallBytes;
-  if (ok) {
+  // A protection page or an endless redirect has no page of its own to
+  // measure; the volume verdict stays «not tested».
+  if (ok && antiBot == null && !redirectLimit) {
     if (pageComplete && bytes >= _minPayloadBytes) {
       payloadOk = true;
       payloadBytes = bytes;
@@ -266,6 +438,7 @@ Future<IpCheckResult> _checkDomain(String domain) async {
       final vc = HttpClient();
       vc.connectionTimeout = const Duration(seconds: 8);
       vc.userAgent = client.userAgent;
+      _pinFamily(vc, ipFamily);
       try {
         for (final u in _assetCandidates(domain, finalUri, body)) {
           final r = await _pull(vc, u);
@@ -316,21 +489,18 @@ Future<IpCheckResult> _checkDomain(String domain) async {
     payloadUrl: payloadUrl,
     payloadFrom: payloadFrom,
     stallBytes: stallBytes,
+    antiBot: antiBot,
+    redirects: redirects,
+    redirectLimit: redirectLimit,
+    ipFamily: ipFamily,
   );
 }
 
-Future<IpCheckResult> _checkIp(String target) async {
-  String? resolvedIp;
-  try {
-    final addresses = await InternetAddress.lookup(target, type: InternetAddressType.IPv4).timeout(const Duration(seconds: 8));
-    if (addresses.isNotEmpty) resolvedIp = addresses.first.address;
-  } catch (_) {
-    // target may already be a literal IP, or DNS itself may be blocked --
-    // both are meaningful outcomes, not fatal to the rest of the check.
-    resolvedIp ??= _asLiteralIp(target);
-  }
-
-  final host = resolvedIp ?? target;
+/// A literal address, IPv4 or (1.17.2) IPv6: TCP 443 / TLS / TCP 80 straight
+/// to it -- an IPv6 one necessarily over the mobile network's IPv6.
+Future<IpCheckResult> _checkIp(InternetAddress target) async {
+  final resolvedIp = target.address;
+  final host = target;
   final sw = Stopwatch()..start();
   bool port443 = false;
   bool port80 = false;
@@ -376,10 +546,28 @@ Future<IpCheckResult> _checkIp(String target) async {
     port443Open: port443,
     tlsOk: tlsOk,
     error: accessible ? null : error,
+    ipFamily: target.type == InternetAddressType.IPv6 ? 6 : 4,
   );
 }
 
-String? _asLiteralIp(String s) {
+/// A dotted IPv4 (as before) or an IPv6 literal, bare or in brackets.
+InternetAddress? _asLiteralIp(String s) {
   final v4 = RegExp(r'^(\d{1,3}\.){3}\d{1,3}$');
-  return v4.hasMatch(s) ? s : null;
+  if (v4.hasMatch(s)) return InternetAddress.tryParse(s);
+  final bare = s.startsWith('[') && s.endsWith(']') ? s.substring(1, s.length - 1) : s;
+  if (!bare.contains(':')) return null;
+  final a = InternetAddress.tryParse(bare);
+  return a != null && a.type == InternetAddressType.IPv6 ? a : null;
+}
+
+/// An AAAA that cannot be the site: unspecified, loopback, link-local,
+/// unique-local, multicast, IPv4-mapped -- what a DNS spoof would hand out.
+bool _isBogusIp6(InternetAddress a) {
+  final b = a.rawAddress;
+  if (b.length != 16) return true;
+  if (b.every((x) => x == 0)) return true;
+  if (a.isLoopback || a.isLinkLocal || a.isMulticast) return true;
+  if ((b[0] & 0xfe) == 0xfc) return true; // fc00::/7
+  if (b.sublist(0, 10).every((x) => x == 0) && b[10] == 0xff && b[11] == 0xff) return true; // ::ffff:a.b.c.d
+  return false;
 }

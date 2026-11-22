@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- In-app update (1.19.0): only the downloaded APK folder is shared with the installer. -->
+<paths>
+    <cache-path name="updates" path="updates/" />
+</paths>

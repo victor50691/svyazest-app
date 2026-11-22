@@ -126,10 +126,45 @@ class NativeBridge {
     }
   }
 
+  /// One GET over the cellular network (NativePlugin.cellularGet): status 0 =
+  /// never reached the host. Body is the response text (<=500 chars).
+  static Future<({bool ok, int status, String body, String? error})> cellularGet(String url,
+      {Map<String, String> headers = const {}, int waitMs = 5000}) async {
+    try {
+      final raw = await _channel.invokeMethod<Object>('cellularGet', {'url': url, 'headers': headers, 'waitMs': waitMs});
+      final m = (raw as Map?) ?? const {};
+      return (
+        ok: m['ok'] == true,
+        status: (m['status'] as num?)?.toInt() ?? 0,
+        body: (m['body'] ?? '').toString(),
+        error: m['error']?.toString(),
+      );
+    } catch (e) {
+      return (ok: false, status: 0, body: '', error: e.toString());
+    }
+  }
+
   /// Is the mobile «белые списки» mode on right now? ICMP + TCP:443 to
   /// [allowed] (must answer) and [control] (must not) over the cellular
   /// network. Returns the raw map: verdict (active | inactive | partial |
   /// no_internet | no_cellular | unknown) plus per-host results.
+  // ── In-app update (1.19.0) ─────────────────────────────────────────
+  /// GET [url] over the server routes (ControlChannel), body into [path].
+  static Future<Map<String, dynamic>> controlDownload(String url, Map<String, String> headers, String path) async {
+    final raw = await _channel.invokeMethod<Object>('controlDownload', {'url': url, 'headers': headers, 'path': path});
+    return Map<String, dynamic>.from((raw as Map?) ?? const {});
+  }
+
+  /// Package, version, signer match with the installed app, SHA-256 of [path].
+  static Future<Map<String, dynamic>> apkCheck(String path) async {
+    final raw = await _channel.invokeMethod<Object>('apkCheck', {'path': path});
+    return Map<String, dynamic>.from((raw as Map?) ?? const {});
+  }
+
+  static Future<bool> canInstallApks() async => await _channel.invokeMethod<bool>('canInstallApks') ?? false;
+  static Future<bool> openInstallSettings() async => await _channel.invokeMethod<bool>('openInstallSettings') ?? false;
+  static Future<bool> installApk(String path) async => await _channel.invokeMethod<bool>('installApk', {'path': path}) ?? false;
+
   static Future<Map<String, dynamic>> whitelistProbe(List<String> allowed, List<String> control) async {
     try {
       final raw = await _channel.invokeMethod<Object>('whitelistProbe', {'allowed': allowed, 'control': control, 'timeoutMs': 3000});
@@ -141,9 +176,11 @@ class NativeBridge {
 
   /// ICMP + TCP:443 to the checked IP/domain itself over the cellular
   /// network: host, ip, icmp_ms, tcp_ms (null = no answer), error.
-  static Future<Map<String, dynamic>> hostProbe(String host) async {
+  /// [family] 6 / 4 (1.17.2): probe only an address of that family (ICMPv6
+  /// echo for IPv6); null = IPv4, as before.
+  static Future<Map<String, dynamic>> hostProbe(String host, {int? family}) async {
     try {
-      final raw = await _channel.invokeMethod<Object>('hostProbe', {'host': host, 'timeoutMs': 5000});
+      final raw = await _channel.invokeMethod<Object>('hostProbe', {'host': host, 'timeoutMs': 5000, 'family': ?family});
       return Map<String, dynamic>.from(_plain(raw) as Map);
     } catch (e) {
       return {'host': host, 'icmp_ms': null, 'tcp_ms': null, 'error': e.toString()};
@@ -153,6 +190,19 @@ class NativeBridge {
   /// Walks all 256 addresses of a /24 over the cellular link (ICMP + TCP
   /// 443/80). Used by the subnet flavour of a БС check, where the question
   /// is whether the operator drops the whole range or only some hosts.
+  /// What the cellular network itself offers over IPv6 (1.17.2), read off
+  /// its LinkProperties -- no traffic: a global (not link-local, not
+  /// unique-local) IPv6 address and an IPv6 default route.
+  static Future<({bool global, bool route, String? error})> cellularIpv6() async {
+    try {
+      final raw = await _channel.invokeMethod<Object>('cellularIpv6');
+      final m = (raw as Map?) ?? const {};
+      return (global: m['global'] == true, route: m['route'] == true, error: m['error']?.toString());
+    } catch (e) {
+      return (global: false, route: false, error: e.toString());
+    }
+  }
+
   static Future<Map<String, dynamic>> subnetProbe(String cidr,
       {int timeoutMs = 1200, int concurrency = 32}) async {
     try {
@@ -199,15 +249,17 @@ class NativeBridge {
 
   /// Starts the embedded Xray-core with a JSON config. Null = started;
   /// otherwise the error text from the core.
-  static Future<String?> xrayStart(String configJson) async {
-    return _channel.invokeMethod<String>('xrayStart', {'config': configJson});
+  /// [core] 'next' = Xray-core 26.10 as a separate process (the server
+  /// flags such keys: job.needsCore); null = the embedded 26.3.27.
+  static Future<String?> xrayStart(String configJson, {String? core}) async {
+    return _channel.invokeMethod<String>('xrayStart', {'config': configJson, 'core': ?core});
   }
 
   /// Stops the core; returns how many of its sockets were bound to the
   /// cellular network vs. not (see NativePlugin.socketBinder).
-  static Future<({int bound, int unbound, String? error})> xrayStop() async {
+  static Future<({int bound, int unbound, String? error})> xrayStop({String? core}) async {
     try {
-      final raw = await _channel.invokeMethod<Object>('xrayStop');
+      final raw = await _channel.invokeMethod<Object>('xrayStop', {'core': ?core});
       final m = (raw as Map?) ?? const {};
       return (
         bound: (m['bound'] as num?)?.toInt() ?? 0,
@@ -217,6 +269,101 @@ class NativeBridge {
     } catch (_) {
       return (bound: 0, unbound: 0, error: null);
     }
+  }
+
+  // Native half of the diagnostics log (NativeLog.kt, 1.14.0).
+  static Future<void> diagNativeEnable(bool on) async {
+    try {
+      await _channel.invokeMethod('diagNativeEnable', {'on': on});
+    } catch (_) {}
+  }
+
+  static Future<List<({int t, String m})>> diagNativeDrain() async {
+    try {
+      final raw = await _channel.invokeMethod<List>('diagNativeDrain');
+      return [
+        for (final x in raw ?? const [])
+          if (x is Map) (t: (x['t'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch, m: (x['m'] ?? '').toString())
+      ];
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  static Future<List<String>> diagEnv() async {
+    try {
+      return ((await _channel.invokeMethod<List>('diagEnv')) ?? const []).map((e) => e.toString()).toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  static Future<List<String>> diagPastExits() async {
+    try {
+      return ((await _channel.invokeMethod<List>('diagPastExits')) ?? const []).map((e) => e.toString()).toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  // «Разрешить сбор логов?» notification (DiagNotifier.kt): see
+  // services/diag_log.dart for the flow.
+  static Future<void> diagShowRequest(int id, [String reason = '']) async {
+    try {
+      await _channel.invokeMethod('diagShowRequest', {'id': id, 'reason': reason});
+    } catch (_) {}
+  }
+
+  static Future<void> diagCancel() async {
+    try {
+      await _channel.invokeMethod('diagCancel');
+    } catch (_) {}
+  }
+
+  /// The answer given on the notification and not delivered yet.
+  static Future<({int id, bool accept})?> diagPeekDecision() async {
+    try {
+      final m = await _channel.invokeMethod<Map>('diagPeekDecision');
+      if (m == null || m['id'] is! int) return null;
+      return (id: m['id'] as int, accept: m['accept'] == true);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> diagClearDecision(int id) async {
+    try {
+      await _channel.invokeMethod('diagClearDecision', {'id': id});
+    } catch (_) {}
+  }
+
+  // «Подтвердить местоположение?» notification (GpsPlugin.kt GpsNotifier).
+  static Future<void> gpsShowRequest(int id, [String reason = '']) async {
+    try {
+      await _channel.invokeMethod('gpsShowRequest', {'id': id, 'reason': reason});
+    } catch (_) {}
+  }
+
+  static Future<void> gpsCancel() async {
+    try {
+      await _channel.invokeMethod('gpsCancel');
+    } catch (_) {}
+  }
+
+  /// A «Отклонить» from the notification not delivered yet (null = none).
+  static Future<int?> gpsPeekDecline() async {
+    try {
+      final v = await _channel.invokeMethod<int>('gpsPeekDecline');
+      return (v == null || v < 0) ? null : v;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> gpsClearDecline(int id) async {
+    try {
+      await _channel.invokeMethod('gpsClearDecline', {'id': id});
+    } catch (_) {}
   }
 
   static Future<String> xrayVersion() async {
@@ -237,6 +384,16 @@ class NativeBridge {
 
   /// Key Attestation chain for [challengeB64], or the reason the phone
   /// could not produce one.
+  /// 1.16.0: the job request signature with the hardware-bound device key
+  /// (NativePlugin.signRequest); null when no key is bound yet.
+  static Future<String?> signRequest(String payload) async {
+    try {
+      return await _channel.invokeMethod<String>('signRequest', {'payload': payload});
+    } catch (_) {
+      return null;
+    }
+  }
+
   static Future<({List<String>? chain, String? error})> attest(String challengeB64) async {
     try {
       final raw = await _channel.invokeMethod<Object>('attest', {'challenge': challengeB64});

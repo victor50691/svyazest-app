@@ -10,7 +10,7 @@ import '../services/api_client.dart';
 import '../services/native_bridge.dart';
 import '../services/secure_store.dart';
 import '../theme.dart';
-import 'main_shell.dart';
+import '../main.dart' show StartupGate;
 
 /// Sign-in. Primary path: one tap opens the Связь Есть? bot with a one-time
 /// deep link; the bot stamps the Telegram account on it and the app, which
@@ -92,7 +92,7 @@ class _LoginScreenState extends State<LoginScreen> {
         _pollTimer?.cancel();
         await SecureStore.saveDevice(r.pair!.deviceToken, r.pair!.executorId);
         if (!mounted) return;
-        Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const MainShell()));
+        Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const StartupGate()));
       } else if (r.status == 'expired') {
         _pollTimer?.cancel();
         setState(() {
@@ -143,7 +143,7 @@ class _LoginScreenState extends State<LoginScreen> {
       );
       await SecureStore.saveDevice(result.deviceToken, result.executorId);
       if (!mounted) return;
-      Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const MainShell()));
+      Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const StartupGate()));
     } on ApiException catch (e) {
       setState(() => _error = e.statusCode == 404 ? 'Код неверный или истёк. Получите новый в боте.' : e.message);
     } catch (_) {
@@ -190,10 +190,7 @@ class _LoginScreenState extends State<LoginScreen> {
             ListView(
               padding: const EdgeInsets.fromLTRB(24, 96, 24, 120),
               children: [
-                const Text(
-                  'Вход',
-                  style: TextStyle(fontSize: 28, fontWeight: FontWeight.w600, letterSpacing: -0.3),
-                ),
+                const Text('Вход', style: TextStyle(fontSize: 28, fontWeight: FontWeight.w600, letterSpacing: -0.3)),
                 const SizedBox(height: 8),
                 Text(
                   _waiting
@@ -235,42 +232,68 @@ class _LoginScreenState extends State<LoginScreen> {
                     ),
                   ],
                   const SizedBox(height: 12),
-                  if (!_manual)
-                    Center(
-                      child: TextButton(
-                        onPressed: () => setState(() => _manual = true),
-                        style: TextButton.styleFrom(foregroundColor: AppColors.textSecondary),
-                        child: const Text('Ввести код вручную'),
+                  // The manual-code block unfolds downward and fades in while
+                  // the link fades out, instead of popping in at once.
+                  AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 380),
+                    reverseDuration: const Duration(milliseconds: 160),
+                    switchInCurve: Curves.easeOutCubic,
+                    switchOutCurve: Curves.easeInCubic,
+                    layoutBuilder: (current, previous) =>
+                        Stack(alignment: Alignment.topCenter, children: [...previous, ?current]),
+                    transitionBuilder: (child, animation) => SizeTransition(
+                      sizeFactor: animation,
+                      alignment: Alignment.topCenter,
+                      child: FadeTransition(
+                        opacity: animation,
+                        child: SlideTransition(
+                          position: Tween<Offset>(begin: const Offset(0, -0.06), end: Offset.zero).animate(animation),
+                          child: child,
+                        ),
                       ),
-                    )
-                  else ...[
-                    const SizedBox(height: 12),
-                    const Text(
-                      'Код выдаёт бот по кнопке «Код для входа», он действует 10 минут.',
-                      style: TextStyle(fontSize: 13, height: 1.4, color: AppColors.textSecondary),
                     ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: _controller,
-                      textCapitalization: TextCapitalization.characters,
-                      maxLength: 8,
-                      style: const TextStyle(fontSize: 20, letterSpacing: 4, fontWeight: FontWeight.w500),
-                      inputFormatters: [UpperCaseTextFormatter()],
-                      decoration: const InputDecoration(counterText: '', hintText: 'Код'),
-                      onSubmitted: (_) => _submitCode(),
-                    ),
-                    const SizedBox(height: 12),
-                    OutlinedButton(
-                      onPressed: _busy ? null : _submitCode,
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: AppColors.textPrimary,
-                        side: const BorderSide(color: AppColors.separator),
-                        minimumSize: const Size.fromHeight(50),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                      ),
-                      child: const Text('Подключить по коду'),
-                    ),
-                  ],
+                    child: !_manual
+                        ? Center(
+                            key: const ValueKey('manual-link'),
+                            child: TextButton(
+                              onPressed: () => setState(() => _manual = true),
+                              style: TextButton.styleFrom(foregroundColor: AppColors.textSecondary),
+                              child: const Text('Ввести код вручную'),
+                            ),
+                          )
+                        : Column(
+                            key: const ValueKey('manual-form'),
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              const SizedBox(height: 12),
+                              const Text(
+                                'Код выдаёт бот по кнопке «Код для входа», он действует 10 минут.',
+                                style: TextStyle(fontSize: 13, height: 1.4, color: AppColors.textSecondary),
+                              ),
+                              const SizedBox(height: 12),
+                              TextField(
+                                controller: _controller,
+                                textCapitalization: TextCapitalization.characters,
+                                maxLength: 8,
+                                style: const TextStyle(fontSize: 20, letterSpacing: 4, fontWeight: FontWeight.w500),
+                                inputFormatters: [UpperCaseTextFormatter()],
+                                decoration: const InputDecoration(counterText: '', hintText: 'Код'),
+                                onSubmitted: (_) => _submitCode(),
+                              ),
+                              const SizedBox(height: 12),
+                              OutlinedButton(
+                                onPressed: _busy ? null : _submitCode,
+                                style: OutlinedButton.styleFrom(
+                                  foregroundColor: AppColors.textPrimary,
+                                  side: const BorderSide(color: AppColors.separator),
+                                  minimumSize: const Size.fromHeight(50),
+                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                                ),
+                                child: const Text('Подключить по коду'),
+                              ),
+                            ],
+                          ),
+                  ),
                 ],
               ],
             ),

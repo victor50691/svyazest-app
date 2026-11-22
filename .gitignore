@@ -61,3 +61,6 @@ app.*.map.json
 
 # Gradle build reports leak into the repo if not ignored.
 /android/build/
+
+# Internal build-server scripts -- not part of the app.
+/build-server/

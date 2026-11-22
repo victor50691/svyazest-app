@@ -18,8 +18,10 @@ class VpnCheckResult {
     this.sites = const [],
     this.download,
     this.bindError,
+    this.core,
   });
 
+  final String? core;
   final bool connected;
   final int? latencyMs;
   final String? error;
@@ -50,6 +52,7 @@ class VpnCheckResult {
         'sites': sites,
         'download': ?download,
         'bind_error': ?bindError,
+        'xray_core': core == 'next' ? '26.10' : '26.3',
       };
 }
 
@@ -57,7 +60,7 @@ class VpnCheckResult {
 /// untestable) the server side's services/vpn_checker.py returns, so admin
 /// tooling and the requesting user's report read the same regardless of
 /// which vantage point produced the result.
-Future<VpnCheckResult> checkVpnKey(String uri, {List<String> probeSites = const [], String? downloadUrl}) async {
+Future<VpnCheckResult> checkVpnKey(String uri, {List<String> probeSites = const [], String? downloadUrl, String? core}) async {
   final parsed = parseVpnUri(uri);
   if (parsed == null) {
     return VpnCheckResult(connected: false, untestable: true, untestableReason: 'unrecognized_scheme');
@@ -80,7 +83,9 @@ Future<VpnCheckResult> checkVpnKey(String uri, {List<String> probeSites = const 
   // unaffected by network binding.
   VpnCheckResult outcome;
   try {
-    final startError = await NativeBridge.xrayStart(jsonEncode(config));
+    // core 'next': keys that need Xray-core 26.10 run on it as a separate
+    // process pinned to the cellular network (XrayNext.kt).
+    final startError = await NativeBridge.xrayStart(jsonEncode(config), core: core);
     if (startError != null) {
       outcome = VpnCheckResult(connected: false, error: 'xray: $startError');
     } else if (!await _waitForPort(localPort)) {
@@ -109,7 +114,7 @@ Future<VpnCheckResult> checkVpnKey(String uri, {List<String> probeSites = const 
   } catch (e) {
     outcome = VpnCheckResult(connected: false, error: e.toString());
   }
-  final stats = await NativeBridge.xrayStop();
+  final stats = await NativeBridge.xrayStop(core: core);
   return VpnCheckResult(
     connected: outcome.connected,
     latencyMs: outcome.latencyMs,
@@ -121,6 +126,7 @@ Future<VpnCheckResult> checkVpnKey(String uri, {List<String> probeSites = const 
     sites: outcome.sites,
     download: outcome.download,
     bindError: stats.error,
+    core: core,
   );
 }
 

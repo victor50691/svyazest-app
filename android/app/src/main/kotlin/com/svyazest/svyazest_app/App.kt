@@ -12,6 +12,8 @@ import io.flutter.embedding.engine.FlutterEngine
 class App : Application() {
     override fun onCreate() {
         super.onCreate()
+        // Keeps the last crash's stack for the diagnostics log (NativeLog.kt).
+        NativeLog.installCrashHandler(this)
         FlutterForegroundTaskPlugin.addTaskLifecycleListener(object : FlutterForegroundTaskLifecycleListener {
             override fun onEngineCreate(flutterEngine: FlutterEngine?) {
                 flutterEngine?.plugins?.add(NativePlugin())

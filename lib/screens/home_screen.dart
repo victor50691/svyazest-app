@@ -6,10 +6,16 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../models/profile.dart';
 import '../services/api_client.dart';
+import '../services/app_updater.dart';
 import '../services/executor_task_handler.dart';
+import '../services/diag_log.dart';
+import '../services/gps_check.dart';
 import '../services/native_bridge.dart';
 import '../services/session_guard.dart';
 import '../theme.dart';
+import '../widgets/diag_stop.dart';
+import '../widgets/level_card.dart';
+import '../widgets/level_up.dart';
 import '../widgets/grouped_list.dart';
 import 'vpn_bypass_guide_screen.dart';
 
@@ -46,6 +52,12 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
   // over cellular; retried when mobile data comes up if it could not be.
   bool _cellularReported = false;
   DateTime? _lastReportAt;
+  // In-app update (1.19.0): a newer version from the server, and what the
+  // «Обновить» button is doing right now (null = idle).
+  AppUpdate? _update;
+  String? _updateBusy;
+  String? _updateError;
+  DateTime? _updateCheckedAt;
 
   @override
   void initState() {
@@ -60,6 +72,7 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
     NativeBridge.cellularRequest(true);
     _refresh();
     unawaited(_reportNetwork());
+    unawaited(_checkUpdate());
     _refreshTimer = Timer.periodic(const Duration(seconds: 15), (_) => _refresh());
     // Network rows update the moment mobile data / a VPN goes up or down.
     _netSub = NativeBridge.networkChanges().listen((st) {
@@ -90,21 +103,36 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
     // (or revoked) something while we were away.
     if (state == AppLifecycleState.resumed) {
       _refresh().then((_) => _permSheetRefresh?.call());
+      unawaited(_checkUpdate());
     }
   }
 
   void _onTaskData(Object data) {
     if (data is Map) {
       if (data['type'] == 'status' && mounted) {
+        final status = data['status'] as String? ?? '';
         setState(() {
           _statusText = data['text'] as String? ?? _statusText;
-          _serviceStatus = data['status'] as String? ?? '';
+          _serviceStatus = status;
+          // The service stops itself on these (min version raised in the
+          // admin panel, country not allowed, signed out): drop «Работает»
+          // at once instead of waiting for the partner to toggle the switch.
+          if (_stopStatuses.contains(status)) _isRunning = false;
         });
+        if (_stopStatuses.contains(status)) {
+          // Re-read the profile/state once the service is really down, so
+          // the reason («Обновитесь», country, sign-out) shows by itself.
+          Future.delayed(const Duration(milliseconds: 1500), () {
+            if (mounted) _refresh();
+          });
+        }
       } else if (data['type'] == 'job_done') {
         _loadProfile();
       }
     }
   }
+
+  static const _stopStatuses = {'app_outdated', 'country_blocked', 'signed_out'};
 
   Future<void> _refresh() async {
     // Cheap, local facts first -- the screen updates at once. The slow parts
@@ -127,13 +155,141 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
     // running, the service goes down with it and the reason is shown. Same
     // for a VPN that forbids bypass, and for a mobile network from a
     // country that is not allowed.
+    _diagScreen('экран: служба=${running ? 'работает' : 'выключена'} статус=$_serviceStatus; '
+        'мобильная=$_hasMobileData переключатель=$_mobileSetting VPN=$_hasVpn блок VPN=$_vpnLockdown; '
+        'разрешения: уведомления=$_notifOk батарея=$_batteryOk; страна заблокирована=$_countryBlocked; '
+        'модерация=${_profile?.moderationStatus} устарела=${_profile?.appOutdated}');
     if (running && !_busy && (!_permsOk || _vpnLockdown || _countryBlocked || _switchLocked)) {
+      DiagLog.app.log('экран останавливает службу: разрешения/VPN/страна/блокировка');
       await FlutterForegroundTask.stopService();
       if (mounted) setState(() => _isRunning = false);
     }
   }
 
   bool get _permsOk => _notifOk && _batteryOk;
+
+  // Diagnostics log (only while the partner allows it): the screen state,
+  // written when it changes rather than every 15 s refresh.
+  String? _diagLastScreen;
+  void _diagScreen(String line) {
+    if (line == _diagLastScreen) return;
+    _diagLastScreen = line;
+    DiagLog.app.log(line);
+  }
+
+  // Support's GPS check: «Разрешить» on the notification opened the app
+  // (launch action) -> run it; pending -> ask here; accepted but not sent
+  // (the partner left midway) -> run it again.
+  bool _gpsBusy = false;
+  Future<void> _handleGps(GpsInfo? info) async {
+    if (_gpsBusy || !mounted) return;
+    _gpsBusy = true;
+    try {
+      final launch = await GpsBridge.takeLaunchAction();
+      final g = await GpsConsent.sync(info);
+      if (g == null || !mounted) return;
+      bool? go;
+      if (g.status == 'accepted' || (launch != null && launch.id == g.id && launch.action == 'accept')) {
+        go = true;
+      } else if (g.status == 'pending') {
+        go = await askGps(context, g.reason);
+      }
+      if (go == null || !mounted) return;
+      if (!go) {
+        await GpsConsent.decline(g);
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Проверка местоположения отклонена')));
+        return;
+      }
+      final msg = await GpsConsent.run(context, g);
+      if (mounted && msg.isNotEmpty) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+    } catch (_) {
+    } finally {
+      _gpsBusy = false;
+    }
+  }
+
+  // Level up / new achievement: shown once, against what this phone showed
+  // last (flutter_foreground_task storage). First run of this version only
+  // remembers the current state -- no fireworks for levels earned before.
+  bool _celebrating = false;
+  Future<void> _celebrate(LevelInfo? info) async {
+    if (info == null || !mounted || _celebrating) return;
+    _celebrating = true;
+    try {
+      final seen = await FlutterForegroundTask.getData<int>(key: 'seen_level');
+      final got = info.achievements.where((a) => a.earnedAt != null).map((a) => a.code).toList()..sort();
+      final seenAch = await FlutterForegroundTask.getData<String>(key: 'seen_achievements');
+      await FlutterForegroundTask.saveData(key: 'seen_level', value: info.level);
+      await FlutterForegroundTask.saveData(key: 'seen_achievements', value: got.join(','));
+      if (!mounted) return;
+      if (seen != null && info.level > seen) {
+        await showLevelUp(context, level: info.level, share: info.share);
+      }
+      if (seenAch != null && mounted) {
+        final before = seenAch.split(',').toSet();
+        for (final a in info.achievements.where((a) => a.earnedAt != null && !before.contains(a.code))) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Новое достижение: «${a.title}»')));
+        }
+      }
+    } catch (_) {
+    } finally {
+      _celebrating = false;
+    }
+  }
+
+  // «Разрешить сбор логов?» in the app itself: can't be dismissed without
+  // an answer. One dialog per request.
+  int? _diagAsking;
+  Future<void> _askDiag(DiagInfo d) async {
+    if (!mounted || _diagAsking == d.id) return;
+    _diagAsking = d.id;
+    final accept = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => PopScope(
+        canPop: false,
+        child: AlertDialog(
+          title: const Text('Разрешите диагностический сбор логов'),
+          content: Text(
+            'Чтобы разобраться, почему приложение «Связь Есть?» работает не так, как задумано, '
+            'нам нужны технические логи с этого устройства.\n\n'
+            '${d.reason.isNotEmpty ? 'Причина запроса: ${d.reason}\n\n' : ''}'
+            'В логах — подробная работа приложения: мобильная сеть, Wi-Fi и VPN (подключения и отключения), '
+            'батарея и энергосбережение, разрешения, связь с сервером, шаги заданий, ошибки и сбои приложения. '
+            'Ваши личные данные, содержимое других приложений, ваше местоположение и проверяемые адреса не собираются.\n\n'
+            'Сбор отключит поддержка, когда закончит диагностику. Остановить его самому можно в любой момент — '
+            'кнопкой на главном экране или в Настройках.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              style: TextButton.styleFrom(foregroundColor: AppColors.textSecondary),
+              child: const Text('Отклонить'),
+            ),
+            TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Разрешить')),
+          ],
+        ),
+      ),
+    );
+    if (accept == null) return;
+    try {
+      final now = await DiagConsent.decide(d, accept, DiagLog.app);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(now?.status == 'accepted'
+            ? 'Сбор логов разрешён. Остановить — в Настройках'
+            : 'Сбор логов отклонён'),
+      ));
+    } catch (_) {
+      // Not delivered: ask again on the next refresh.
+      _diagAsking = null;
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Не удалось отправить ответ, попробуем ещё раз')),
+        );
+      }
+    }
+  }
 
   /// Partner application not approved yet (or rejected) in the Telegram
   /// bot: signed in, but the work switch stays locked.
@@ -146,9 +302,84 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
   bool get _switchLocked => _updateLocked || _moderationLocked;
 
   Future<void> _openUpdate() async {
+    // In-app update when the server has the file; the download link otherwise.
+    if (_update != null) return _runUpdate();
     final url = _profile?.updateUrl;
     if (url == null || url.isEmpty) return;
     await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+  }
+
+  /// Asks the server for a newer version: on start, on return to the app,
+  /// at most every 30 minutes.
+  Future<void> _checkUpdate({bool force = false}) async {
+    final now = DateTime.now();
+    if (!force && _updateCheckedAt != null && now.difference(_updateCheckedAt!) < const Duration(minutes: 30)) return;
+    _updateCheckedAt = now;
+    try {
+      final u = await AppUpdater.check();
+      if (mounted) setState(() => _update = u);
+    } catch (_) {}
+  }
+
+  Future<void> _runUpdate() async {
+    final u = _update;
+    if (u == null || _updateBusy != null) return;
+    setState(() {
+      _updateBusy = 'Скачиваю обновление (${u.sizeLabel})…';
+      _updateError = null;
+    });
+    try {
+      final path = await AppUpdater.download(u);
+      if (!mounted) return;
+      setState(() => _updateBusy = 'Открываю установку…');
+      final started = await AppUpdater.install(path);
+      if (!mounted) return;
+      if (!started) {
+        setState(() => _updateError =
+            'Разрешите установку обновлений: в открывшихся настройках включите «Разрешить из этого источника», '
+            'вернитесь и нажмите «Обновить» ещё раз.');
+      }
+    } catch (e) {
+      if (mounted) setState(() => _updateError = e.toString().replaceFirst('Exception: ', ''));
+    } finally {
+      if (mounted) setState(() => _updateBusy = null);
+    }
+  }
+
+  Widget _updateCard() {
+    final u = _update!;
+    return Container(
+      margin: const EdgeInsets.fromLTRB(0, 8, 0, 12),
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+      decoration: BoxDecoration(color: AppColors.group, borderRadius: BorderRadius.circular(12)),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Доступно обновление ${u.version}',
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+          const SizedBox(height: 4),
+          Text(
+            _updateBusy ?? 'Установленная версия ${ApiClient.appVersion ?? '—'}. Обновление скачается в приложении, '
+                'Android попросит подтвердить установку.',
+            style: const TextStyle(fontSize: 13, height: 1.4, color: AppColors.textSecondary),
+          ),
+          if (_updateError != null) ...[
+            const SizedBox(height: 6),
+            Text(_updateError!, style: const TextStyle(fontSize: 13, height: 1.4, color: AppColors.warning)),
+          ],
+          const SizedBox(height: 10),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton(
+              onPressed: _updateBusy == null ? _runUpdate : null,
+              child: _updateBusy == null
+                  ? const Text('Обновить')
+                  : const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _reportNetwork() async {
@@ -222,7 +453,14 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
     try {
       final p = await _api.profile();
       if (mounted) setState(() => _profile = p);
+      // Support's log request: deliver a notification answer, keep the
+      // notification in sync, ask here too while it is pending.
+      final diag = await DiagConsent.sync(p.diag, DiagLog.app);
+      if (diag != null && diag.status == 'pending') unawaited(_askDiag(diag));
+      unawaited(_celebrate(p.level));
+      unawaited(_handleGps(p.gps));
     } catch (e) {
+      DiagLog.app.log('профиль не загрузился: $e');
       // Signed out elsewhere / banned -> leave the shell; anything else is
       // offline or not yet reachable -- keep showing the last known values.
       if (mounted) await handleAuthFailure(context, e);
@@ -329,6 +567,7 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
             callback: executorTaskHandlerCallback,
           );
     if (result is ServiceRequestFailure) {
+      DiagLog.app.log('служба не запустилась: ${result.error}');
       if (mounted) {
         setState(() => _isRunning = false);
         ScaffoldMessenger.of(context).showSnackBar(
@@ -348,6 +587,7 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
     if (_busy) return;
     _busy = true;
     try {
+      DiagLog.app.log('переключатель «Работать»: ${value ? 'включить' : 'выключить'}');
       if (!value) {
         // Flip first, stop second -- the word changes the moment it is tapped.
         if (mounted) {
@@ -412,6 +652,7 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
       child: ListView(
         padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
         children: [
+          if (_update != null) _updateCard(),
           // The whole status row is the switch: tapping the word toggles
           // too, so nobody has to aim for the small control on the right.
           InkWell(
@@ -451,7 +692,7 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
                               height: 1.1,
                               color: _headline() == 'Работает'
                                   ? AppColors.success
-                                  : (_headline() == 'На модерации' || _headline() == 'Нужно обновление'
+                                  : (_headline() == 'На модерации' || _headline() == 'Обновитесь' || _headline() == 'Нет БС'
                                       ? AppColors.warning
                                       : AppColors.danger),
                             ),
@@ -493,7 +734,7 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
                 style: const TextStyle(fontSize: 13, height: 1.45, color: AppColors.textSecondary),
               ),
             ),
-            if ((_profile!.updateUrl ?? '').isNotEmpty) ...[
+            if ((_profile!.updateUrl ?? '').isNotEmpty && _update == null) ...[
               const SizedBox(height: 12),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -529,7 +770,7 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
               ),
             ),
             const SizedBox(height: 20),
-            const VpnBypassClientsSection(header: 'Инструкция для вашего VPN-клиента'),
+            const VpnBypassClientsSection(header: 'Инструкция для вашего VPN'),
             const SizedBox(height: 20),
           ],
           ..._partnerSection(),
@@ -554,14 +795,47 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
               ),
             ],
           ),
+          if (_profile?.level != null) ...[
+            const SizedBox(height: 20),
+            LevelCard(info: _profile!.level!),
+          ],
+          // Logs for support are being collected: say so where it is seen,
+          // with a way to stop (warned first, see widgets/diag_stop.dart).
+          ValueListenableBuilder<int?>(
+            valueListenable: DiagLog.app.activeId,
+            builder: (context, id, _) => id == null
+                ? const SizedBox.shrink()
+                : Padding(
+                    padding: const EdgeInsets.only(top: 20),
+                    child: GroupedSection(
+                      header: 'Диагностика',
+                      children: [
+                        const GroupedRow(label: 'Идёт сбор логов для поддержки', value: 'включён', valueColor: AppColors.warning),
+                        GroupedRow(
+                          label: 'Остановить сбор логов',
+                          labelColor: AppColors.danger,
+                          onTap: () => confirmStopDiag(context, id),
+                        ),
+                      ],
+                    ),
+                  ),
+          ),
           const SizedBox(height: 20),
           GroupedSection(
             header: 'Баланс',
             children: [
-              GroupedRow(label: 'Доступно', value: _money(_profile?.balance), valueColor: AppColors.textPrimary),
+              GroupedRow(
+                label: 'Доступно',
+                value: _money(_profile?.availableBalance ?? _profile?.balance),
+                valueColor: AppColors.textPrimary,
+              ),
+              // Hold on withdrawals (admin panel): rewards of the last N
+              // days are on the balance but can't be withdrawn yet.
+              if ((_profile?.heldBalance ?? 0) > 0)
+                GroupedRow(label: 'В холде (${_profile!.holdDays} дн.)', value: _money(_profile!.heldBalance)),
               GroupedRow(label: 'Заработано всего', value: _money(_profile?.totalEarned)),
               GroupedRow(label: 'Заданий выполнено', value: '${_profile?.totalJobsCompleted ?? '—'}'),
-              GroupedRow(label: 'Трафик на проверки', value: _traffic(_profile?.trafficBytesTotal)),
+              GroupedRow(label: 'Трафика использовано', value: _traffic(_profile?.trafficBytesTotal)),
             ],
           ),
           if (_hasVpn && !_vpnLockdown) ...[
@@ -636,12 +910,15 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
   /// for mobile data -- that is not "working", so it says «Отключено» and
   /// the subtitle tells what to do.
   String _headline() {
-    if (!_isRunning && _updateLocked) return 'Нужно обновление';
+    if (!_isRunning && _updateLocked) return 'Обновитесь';
     if (!_isRunning && _moderationLocked) {
       return _profile!.moderationStatus == 'rejected' ? 'Заявка отклонена' : 'На модерации';
     }
     if (!_isRunning) return 'Остановлено';
     if (_serviceStatus == 'no_mobile_data') return 'Отключено';
+    // «Задания только при БС» is on and the operator has no whitelist mode
+    // right now: still on, no jobs; flips back to «Работает» by itself.
+    if (_serviceStatus == 'no_whitelist') return 'Нет БС';
     return 'Работает';
   }
 

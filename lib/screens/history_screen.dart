@@ -145,9 +145,9 @@ class _JobRow extends StatelessWidget {
   };
 
   // Domain and IP checks are one kind of job for the executor, and the
-  // VPN protocol is noise here -- just "VPN-ключ".
+  // VPN protocol is noise here -- just "VPN".
   static const _typeLabels = {
-    'vpn_key': 'VPN-ключ',
+    'vpn_key': 'VPN',
     'ip': 'Домен/IP',
     'domain': 'Домен/IP',
   };
