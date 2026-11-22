@@ -200,7 +200,7 @@ class GpsConsent {
     // already stopped by GpsPlugin.fix; the permission goes back (Android 13+)
     // and, if location was off before, the partner may switch it off again.
     await GpsBridge.releasePermission();
-    if (locationWasOff && context.mounted && await GpsBridge.locationEnabled()) {
+    if (locationWasOff && await GpsBridge.locationEnabled() && context.mounted) {
       final off = await showDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(

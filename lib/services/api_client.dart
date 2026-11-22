@@ -116,7 +116,7 @@ class ApiClient {
   Map<String, String> _jsonHeaders([String? token]) => {
         'Content-Type': 'application/json',
         if (token != null) 'Authorization': 'Bearer $token',
-        if (appVersion != null) 'X-App-Version': appVersion!,
+        'X-App-Version': ?appVersion,
       };
 
   Map<String, dynamic> _decode(http.Response resp) {

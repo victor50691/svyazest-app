@@ -217,7 +217,7 @@ class NativeBridge {
     }
   }
 
-  /// Platform-channel maps come back as Map<Object?, Object?>; jsonEncode
+  /// Platform-channel maps come back as `Map<Object?, Object?>`; jsonEncode
   /// needs String keys all the way down.
   static Object? _plain(Object? v) {
     if (v is Map) return v.map((k, val) => MapEntry(k.toString(), _plain(val)));
