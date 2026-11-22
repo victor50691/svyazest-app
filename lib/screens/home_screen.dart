@@ -919,6 +919,8 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
     // «Задания только при БС» is on and the operator has no whitelist mode
     // right now: still on, no jobs; flips back to «Работает» by itself.
     if (_serviceStatus == 'no_whitelist') return 'Нет БС';
+    // 1.20.0: the server put the phone on hold (services/integrityWatch.js).
+    if (_serviceStatus == 'integrity_hold') return 'На проверке';
     return 'Работает';
   }
 

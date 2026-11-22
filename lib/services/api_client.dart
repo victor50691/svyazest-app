@@ -28,10 +28,15 @@ class HeartbeatReply {
     this.diag,
     this.gps,
     this.attestDue = false,
+    this.integrityHold,
   });
 
   /// The hardware-bound key is due for its daily re-attestation (1.16.0).
   final bool attestDue;
+
+  /// 1.20.0: the server put this phone on hold (root seen earlier and
+  /// hidden now, or root traces) -- no jobs until support clears it.
+  final String? integrityHold;
 
   /// Hosts that stay reachable under a whitelist, and neutral ones that do
   /// not -- the verdict is the comparison between them.
@@ -209,6 +214,7 @@ class ApiClient {
     String? whitelistVerdict,
     bool? ipv6,
     bool? rooted,
+    List<String>? rootSignals,
   }) async {
     final token = await SecureStore.getDeviceToken();
     if (token == null) return const HeartbeatReply();
@@ -232,6 +238,9 @@ class ApiClient {
             // phone jobs only if the admin made an exception for the
             // partner (executors.integrity_exempt).
             'rooted': ?rooted,
+            // 1.20.0: root traces (NativeBridge.rootSignals) -- the server
+            // decides what they mean.
+            'root_signals': ?rootSignals,
           }),
         )
         .timeout(const Duration(seconds: 15));
@@ -244,6 +253,7 @@ class ApiClient {
       diag: DiagInfo.fromJson(body['diag']),
       gps: GpsInfo.fromJson(body['gps']),
       attestDue: body['attest_due'] == true,
+      integrityHold: body['integrity_hold'] as String?,
     );
   }
 

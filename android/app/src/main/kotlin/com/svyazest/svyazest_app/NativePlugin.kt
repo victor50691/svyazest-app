@@ -123,6 +123,7 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             "hasActiveVpn" -> result.success(hasActiveVpn())
             "networkState" -> result.success(networkState())
             "isRooted" -> result.success(isRooted())
+            "rootSignals" -> result.success(rootSignals())
             "hwid" -> result.success(hwid())
             "openNotificationSettings" -> result.success(openNotificationSettings())
             // Both work from the application context, i.e. also inside the
@@ -1092,5 +1093,57 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             if (runCatching { context.packageManager.getPackageInfo(pkg, 0) }.isSuccess) return true
         }
         return false
+    }
+
+    // ---- root traces for the server (1.20.0) ----
+    //
+    // isRooted() above is what the app itself acts on; these traces go to
+    // the server with the heartbeat (root_signals) and the server decides
+    // (admin-panel/services/integrityWatch.js). They look where hiding
+    // modules leave marks: the mount table and the memory map of this very
+    // process (Zygisk / LSPosed inject into it), the apps that only exist
+    // on a rooted phone (Hide My Applist, LSPosed manager) and the boot
+    // properties of an unlocked bootloader.
+    private fun rootSignals(): List<String> {
+        val out = linkedSetOf<String>()
+        val mountMarks = listOf("zygisk", "lsposed", "magisk", "kernelsu", "apatch", "/data/adb", "/debug_ramdisk", "tricky")
+        for (f in listOf("/proc/self/mountinfo", "/proc/self/mounts")) {
+            val text = runCatching { File(f).readText() }.getOrNull() ?: continue
+            val low = text.lowercase()
+            for (m in mountMarks) if (low.contains(m)) out.add("mount:" + m.trim('/'))
+        }
+        val mapMarks = listOf("zygisk", "lsposed", "lspd", "riru", "xposed", "frida", "magisk", "shamiko")
+        runCatching {
+            File("/proc/self/maps").bufferedReader().useLines { lines ->
+                for (line in lines) {
+                    val low = line.lowercase()
+                    for (m in mapMarks) if (low.contains(m)) out.add("maps:$m")
+                }
+            }
+        }
+        val pkgs = mapOf(
+            "com.tsng.hidemyapplist" to "hma", "org.frknkrc44.hma_oss" to "hma",
+            "org.lsposed.manager" to "lsposed", "io.github.lsposed.manager" to "lsposed",
+            "com.topjohnwu.magisk" to "magisk", "io.github.huskydg.magisk" to "magisk", "io.github.vvb2060.magisk" to "magisk",
+            "me.weishu.kernelsu" to "kernelsu", "com.rifsxd.ksunext" to "kernelsu", "com.sukisu.ultra" to "kernelsu",
+            "me.bmax.apatch" to "apatch",
+        )
+        for ((pkg, tag) in pkgs) {
+            if (runCatching { context.packageManager.getPackageInfo(pkg, 0) }.isSuccess) out.add("pkg:$tag")
+        }
+        for (p in listOf("/data/adb/magisk", "/data/adb/ksu", "/data/adb/ap", "/data/adb/modules", "/system/xbin/su", "/system/bin/su", "/sbin/su")) {
+            if (runCatching { File(p).exists() }.getOrDefault(false)) out.add("path:$p")
+        }
+        if (Build.TAGS?.contains("test-keys") == true) out.add("prop:test-keys")
+        val prop = { k: String -> runCatching {
+            Class.forName("android.os.SystemProperties").getMethod("get", String::class.java).invoke(null, k) as String
+        }.getOrDefault("") }
+        val vbs = prop("ro.boot.verifiedbootstate")
+        if (vbs == "orange" || vbs == "yellow" || vbs == "red") out.add("prop:verifiedbootstate=$vbs")
+        if (prop("ro.boot.flash.locked") == "0") out.add("prop:flash.locked=0")
+        if (prop("ro.boot.vbmeta.device_state") == "unlocked") out.add("prop:vbmeta=unlocked")
+        if (prop("ro.debuggable") == "1") out.add("prop:debuggable=1")
+        if (prop("ro.secure") == "0") out.add("prop:secure=0")
+        return out.toList()
     }
 }

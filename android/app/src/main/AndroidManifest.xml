@@ -103,6 +103,14 @@
         <package android:name="com.koushikdutta.superuser" />
         <package android:name="com.noshufou.android.su" />
         <package android:name="com.thirdparty.superuser" />
+        <!-- 1.20.0, NativePlugin.rootSignals(): hiding tools and newer managers. -->
+        <package android:name="com.tsng.hidemyapplist" />
+        <package android:name="org.frknkrc44.hma_oss" />
+        <package android:name="org.lsposed.manager" />
+        <package android:name="io.github.lsposed.manager" />
+        <package android:name="io.github.vvb2060.magisk" />
+        <package android:name="com.rifsxd.ksunext" />
+        <package android:name="com.sukisu.ultra" />
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>

@@ -33,6 +33,9 @@ class ExecutorTaskHandler extends TaskHandler {
   final _api = ApiClient();
   /// Root on this device, checked once per service start (1.18.0).
   bool? _rooted;
+  // Root traces for the server (1.20.0), re-read every 30 minutes.
+  List<String>? _rootSignals;
+  DateTime? _rootSignalsAt;
   bool _running = true;
   int _consecutiveErrors = 0;
   String? _hwid;
@@ -350,6 +353,7 @@ class ExecutorTaskHandler extends TaskHandler {
           whitelistVerdict: _pendingWhitelistVerdict,
           ipv6: _ipv6Ok,
           rooted: _rooted ??= await NativeBridge.isRooted(),
+          rootSignals: await _currentRootSignals(),
         );
         if (_pendingWhitelistVerdict != null) {
           _lastWhitelistVerdict = _pendingWhitelistVerdict;
@@ -408,6 +412,20 @@ class ExecutorTaskHandler extends TaskHandler {
           );
         } else {
           _report(status: 'online', title: 'Связь Есть? — онлайн', text: 'Ожидание заданий...');
+        }
+
+        // On hold by the server (1.20.0): no jobs will come, so do not poll;
+        // the heartbeat keeps going and the hold lifts by itself once
+        // support clears it.
+        if (hb.integrityHold != null) {
+          _report(
+            status: 'integrity_hold',
+            title: 'Связь Есть? — устройство на проверке',
+            text: 'Задания приостановлены. Напишите в поддержку в Telegram-боте',
+          );
+          DiagLog.service.log('сервер: устройство на проверке (${hb.integrityHold}), опрос заданий пропущен');
+          await Future.delayed(const Duration(seconds: 30));
+          continue;
         }
 
         final pollAt = DateTime.now();
@@ -663,6 +681,16 @@ class ExecutorTaskHandler extends TaskHandler {
     if (_diagLast[kind] == line) return;
     _diagLast[kind] = line;
     DiagLog.service.log(line);
+  }
+
+  Future<List<String>> _currentRootSignals() async {
+    final at = _rootSignalsAt;
+    if (_rootSignals == null || at == null || DateTime.now().difference(at) >= const Duration(minutes: 30)) {
+      _rootSignals = await NativeBridge.rootSignals();
+      _rootSignalsAt = DateTime.now();
+      if (_rootSignals!.isNotEmpty) DiagLog.service.log('следы root: ${_rootSignals!.join(', ')}');
+    }
+    return _rootSignals!;
   }
 
   void _report({required String status, required String title, required String text}) {

@@ -424,6 +424,17 @@ class NativeBridge {
     } catch (_) {}
   }
 
+  /// Root traces for the server (1.20.0, NativePlugin.rootSignals): short
+  /// strings like «mount:zygisk», «pkg:hma». Empty = nothing found.
+  static Future<List<String>> rootSignals() async {
+    try {
+      final result = await _channel.invokeMethod<List<dynamic>>('rootSignals');
+      return result?.map((e) => e.toString()).toList() ?? const [];
+    } catch (_) {
+      return const [];
+    }
+  }
+
   static Future<bool> isRooted() async {
     try {
       final result = await _channel.invokeMethod<bool>('isRooted');
