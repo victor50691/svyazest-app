@@ -19,7 +19,7 @@
 # с qemu-user-binfmt для чужих архитектур.
 set -euo pipefail
 
-VERSION="${VERSION:-1.0.8}"
+VERSION="${VERSION:-1.0.9}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 DIST="$ROOT/dist"
 WORK="$DIST/.work"

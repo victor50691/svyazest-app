@@ -71,6 +71,13 @@
     if (s < 60) return s + ' с';
     return Math.floor(s / 60) + ' мин ' + two(s % 60) + ' с';
   }
+  // 1.0.9: is the server answering right now (st.server), by which path.
+  const serverLabel = (st) => {
+    const sv = st.server || {};
+    if (!sv.at) return h('b', { text: 'ещё не было запросов' });
+    if (!sv.ok) return h('span', {}, h('b', { class: 'c-bad', text: 'нет связи' }), ' — ' + (sv.error || 'сервер недоступен'));
+    return h('span', {}, h('b', { class: 'c-ok', text: 'есть' }), st.route ? ' · ' + routeLabel(st.route) : '');
+  };
   const routeLabel = (r) => {
     if (!r) return 'ещё не было запросов';
     if (r === 'cellular') return 'модем (запасной путь)';
@@ -245,6 +252,8 @@
   function tabKey() {
     const st = { ...S.status };
     delete st.since; delete st.started;
+    // server.at moves with every request: re-render only when the verdict does
+    st.server = { ok: !!(st.server && st.server.ok), seen: !!(st.server && st.server.at), error: st.server && st.server.error };
     if (tab === 'home') return [st, S.profile];
     if (tab === 'history') return [history, S.status.jobs_done];
     return [st.attest, st.route, st.diag, st.diag_on, st.executor_id, S.about, modems, S.status.modem];
@@ -368,7 +377,7 @@
       h('div', { class: 'hero-main' },
         h('div', { class: 'headline' }, h('span', { class: 'dot' }), st.headline || '—'),
         h('div', { class: 'subtitle', text: st.text || '' })),
-      h('div', { class: 'route-pill' }, 'Связь с сервером: ', h('b', { text: routeLabel(st.route) })));
+      h('div', { class: 'route-pill' }, 'Связь с сервером: ', serverLabel(st)));
     out.append(hero);
     if (st.code === 'running' && st.job) {
       out.append(h('div', { class: 'jobbar' }));

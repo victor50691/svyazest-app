@@ -48,6 +48,7 @@ type Status struct {
 
 	Modem     *ModemView    `json:"modem,omitempty"`
 	Route     string        `json:"route"`
+	Server    ServerView    `json:"server"` // 1.0.9: «Связь с сервером» сейчас
 	Whitelist WhitelistView `json:"whitelist"`
 	Job       *JobView      `json:"job,omitempty"`
 	JobsDone  int           `json:"jobs_done"`
@@ -85,6 +86,13 @@ type ModemView struct {
 	// 1.0.6: Operator / Country came from the mobile network's IP (server).
 	OperatorByIP bool `json:"operator_by_ip,omitempty"`
 	CountryByIP  bool `json:"country_by_ip,omitempty"`
+}
+
+// ServerView: the last exchange with the server (api.Client.Link).
+type ServerView struct {
+	OK    bool       `json:"ok"`
+	At    *time.Time `json:"at,omitempty"`
+	Error string     `json:"error,omitempty"`
 }
 
 type WhitelistView struct {
@@ -189,6 +197,9 @@ func (r *Runner) Snapshot() Status {
 	defer r.mu.RUnlock()
 	s := r.status
 	s.Route = r.api.Route()
+	if ok, at, why := r.api.Link(); !at.IsZero() {
+		s.Server = ServerView{OK: ok, At: &at, Error: why}
+	}
 	if d, ok := r.st.Device(); ok {
 		s.LoggedIn, s.ExecutorID = true, d.ExecutorID
 	}

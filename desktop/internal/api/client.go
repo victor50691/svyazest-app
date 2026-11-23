@@ -51,6 +51,11 @@ type Client struct {
 
 	clockOffsetMs atomic.Int64 // server clock - local clock (Date header)
 	lastRoute     atomic.Value // string
+	// 1.0.9: the last answer of the server over the control channel and the
+	// last failure to get one (unix ms), for «Связь с сервером».
+	lastOKMs   atomic.Int64
+	lastFailMs atomic.Int64
+	lastFail   atomic.Value // string
 	// OnRoute: called when the route to the server changes.
 	OnRoute func(route string)
 }
@@ -85,6 +90,26 @@ func (c *Client) Route() string {
 		}
 	}
 	return ""
+}
+
+// Link: whether the last request to the server over the control channel
+// got an answer (any HTTP status below 500), when, and why not. at is zero
+// before the first request.
+func (c *Client) Link() (ok bool, at time.Time, why string) {
+	okMs, failMs := c.lastOKMs.Load(), c.lastFailMs.Load()
+	if okMs == 0 && failMs == 0 {
+		return false, time.Time{}, ""
+	}
+	if okMs >= failMs {
+		return true, time.UnixMilli(okMs), ""
+	}
+	why, _ = c.lastFail.Load().(string)
+	return false, time.UnixMilli(failMs), why
+}
+
+func (c *Client) linkFail(why string) {
+	c.lastFail.Store(why)
+	c.lastFailMs.Store(time.Now().UnixMilli())
 }
 
 // ServerNowMs: the server's clock as estimated from the last Date header.
@@ -135,6 +160,7 @@ type reqOpts struct {
 }
 
 func (c *Client) call(ctx context.Context, method, path string, in, out any, o reqOpts) error {
+	parent := ctx
 	var body io.Reader
 	var raw []byte
 	if in != nil {
@@ -207,9 +233,24 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any, o r
 	}
 	resp, err := doer.Do(req)
 	if err != nil {
+		// Our own stop (shutdown, logout) says nothing about the server.
+		if o.doer == nil && parent.Err() == nil {
+			why := "сервер недоступен"
+			if errors.Is(err, context.DeadlineExceeded) {
+				why = "сервер не ответил вовремя"
+			}
+			c.linkFail(why)
+		}
 		return err
 	}
 	defer resp.Body.Close()
+	if o.doer == nil {
+		if resp.StatusCode >= 500 {
+			c.linkFail(fmt.Sprintf("сервер ответил ошибкой (HTTP %d)", resp.StatusCode))
+		} else {
+			c.lastOKMs.Store(time.Now().UnixMilli())
+		}
+	}
 	if o.doer == nil && c.Ctl != nil {
 		if r := c.Ctl.LastRoute(); r != "" && r != "—" {
 			prev, _ := c.lastRoute.Load().(string)

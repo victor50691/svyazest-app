@@ -6,6 +6,8 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../models/profile.dart';
 import '../services/api_client.dart';
+import '../services/control_http.dart';
+import '../services/link_state.dart';
 import '../services/app_updater.dart';
 import '../services/executor_task_handler.dart';
 import '../services/diag_log.dart';
@@ -58,6 +60,19 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
   String? _updateBusy;
   String? _updateError;
   DateTime? _updateCheckedAt;
+  // «Связь с сервером» (1.21.0): the latest exchange with the server, from
+  // the service or from this screen's own profile request -- whichever is
+  // newer -- and the path it went by (ControlChannel).
+  bool? _srvOk;
+  DateTime? _srvAt;
+  String? _srvError;
+  String _srvRoute = '';
+  // «Белые списки»: the latest measurement (service or this screen).
+  String? _wl;
+  DateTime? _wlAt;
+  bool _wlRequired = true;
+  bool _wlProbing = false;
+  DateTime? _wlTriedAt;
 
   @override
   void initState() {
@@ -128,13 +143,16 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
         }
       } else if (data['type'] == 'job_done') {
         _loadProfile();
+      } else if (data['type'] == 'link' && mounted) {
+        _applyLink(Map<String, dynamic>.from(data));
+        unawaited(_loadRoute());
       }
     }
   }
 
   static const _stopStatuses = {'app_outdated', 'country_blocked', 'signed_out'};
 
-  Future<void> _refresh() async {
+  Future<void> _refresh({bool forceWl = false}) async {
     // Cheap, local facts first -- the screen updates at once. The slow parts
     // (cellular probe up to 4 s behind a VPN, profile over the network) run
     // after that and never hold the switch.
@@ -149,8 +167,12 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
       _mobileSetting = net.mobileSetting;
     });
     await _checkLockdown();
+    final saved = await LinkStore.load();
+    if (saved != null && mounted) _applyLink(saved);
     await _loadProfile();
+    unawaited(_loadRoute());
     await _checkCountry();
+    unawaited(_probeWhitelist(running: running, force: forceWl));
     // Permissions are mandatory: if one was revoked while the service was
     // running, the service goes down with it and the reason is shown. Same
     // for a VPN that forbids bypass, and for a mobile network from a
@@ -452,6 +474,7 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
   Future<void> _loadProfile() async {
     try {
       final p = await _api.profile();
+      _markServer(true);
       if (mounted) setState(() => _profile = p);
       // Support's log request: deliver a notification answer, keep the
       // notification in sync, ask here too while it is pending.
@@ -461,9 +484,126 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
       unawaited(_handleGps(p.gps));
     } catch (e) {
       DiagLog.app.log('профиль не загрузился: $e');
+      _markServer(false, error: e is ApiException ? 'сервер ответил ошибкой (HTTP ${e.statusCode})' : 'сервер недоступен');
       // Signed out elsewhere / banned -> leave the shell; anything else is
       // offline or not yet reachable -- keep showing the last known values.
       if (mounted) await handleAuthFailure(context, e);
+    }
+  }
+
+  void _markServer(bool ok, {String? error, DateTime? at}) {
+    final t = at ?? DateTime.now();
+    if (_srvAt != null && t.isBefore(_srvAt!)) return; // an older result
+    if (!mounted) return;
+    setState(() {
+      _srvOk = ok;
+      _srvAt = t;
+      _srvError = ok ? null : error;
+    });
+  }
+
+  /// A {'type': 'link'} message of the service, live or as kept in storage.
+  void _applyLink(Map<String, dynamic> m) {
+    final at = (m['at'] as num?)?.toInt();
+    if (at != null) {
+      _markServer(m['ok'] == true, error: m['error']?.toString(), at: DateTime.fromMillisecondsSinceEpoch(at));
+    }
+    final wlAt = (m['wl_at'] as num?)?.toInt();
+    final wl = m['wl']?.toString();
+    if (wlAt != null && wl != null) _setWhitelist(wl, DateTime.fromMillisecondsSinceEpoch(wlAt));
+    if (m['wl_required'] is bool && mounted) setState(() => _wlRequired = m['wl_required'] as bool);
+  }
+
+  void _setWhitelist(String verdict, DateTime at) {
+    if (_wlAt != null && at.isBefore(_wlAt!)) return;
+    if (!mounted) return;
+    setState(() {
+      _wl = verdict;
+      _wlAt = at;
+    });
+  }
+
+  Future<void> _loadRoute() async {
+    final i = await ControlHttpClient.info();
+    if (mounted && i.route != _srvRoute) setState(() => _srvRoute = i.route);
+  }
+
+  /// With the service off nobody measures the whitelist mode, so the screen
+  /// does it: over the mobile network (NativePlugin picks it explicitly),
+  /// with the hosts of the last heartbeat, at most every 5 minutes (pull to
+  /// refresh -- now). While the service runs it measures on the server's
+  /// schedule and this screen only shows its result.
+  Future<void> _probeWhitelist({required bool running, bool force = false}) async {
+    if (running || _wlProbing || !_hasMobileData) return;
+    final now = DateTime.now();
+    if (!force) {
+      if (_wlAt != null && now.difference(_wlAt!) < const Duration(minutes: 5)) return;
+      if (_wlTriedAt != null && now.difference(_wlTriedAt!) < const Duration(minutes: 2)) return;
+    }
+    final lists = await LinkStore.lists();
+    if (lists == null) return;
+    _wlTriedAt = now;
+    if (mounted) setState(() => _wlProbing = true);
+    try {
+      final r = await NativeBridge.whitelistProbe(lists.allowed, lists.control);
+      final v = r['verdict']?.toString();
+      DiagLog.app.log('экран: замер белых списков — $v');
+      if (v != null && v != 'unknown') _setWhitelist(v, DateTime.now());
+      if (mounted) setState(() => _wlRequired = lists.required);
+    } catch (_) {
+    } finally {
+      if (mounted) setState(() => _wlProbing = false);
+    }
+  }
+
+  /// «Связь с сервером»: trailing word, its colour and the line under it.
+  ({String word, Color color, String sub}) _serverView() {
+    final at = _srvAt;
+    if (_srvOk == null || at == null) {
+      return (word: 'Проверяю…', color: AppColors.textSecondary, sub: 'сервер, с которого приходят задания');
+    }
+    final via = (_srvRoute.isEmpty || _srvRoute == '—' || _srvRoute == 'нет связи') ? '' : 'через $_srvRoute · ';
+    if (_srvOk == true) {
+      // Nothing heard for a while (service off, screen just opened): say how
+      // old the answer is rather than claim the link is up right now.
+      final fresh = DateTime.now().difference(at) < const Duration(minutes: 2);
+      return (word: 'Есть', color: fresh ? AppColors.success : AppColors.textSecondary, sub: '$via${agoText(at)}');
+    }
+    final hint = _wl == 'active' ? ' · под БС нужен Wi-Fi или прокси VPN-клиента' : '';
+    return (word: 'Нет связи', color: AppColors.danger, sub: '${_srvError ?? 'сервер недоступен'} · ${agoText(at)}$hint');
+  }
+
+  /// «Белые списки»: trailing word, its colour and the line under it.
+  ({String word, Color color, String sub}) _whitelistView() {
+    final at = _wlAt;
+    // The server trusts a measurement for 15 minutes; older is not «now».
+    final fresh = at != null && DateTime.now().difference(at) < const Duration(minutes: 15);
+    if (_wlProbing && !fresh) {
+      return (word: 'Проверяю…', color: AppColors.textSecondary, sub: 'замер через мобильную сеть');
+    }
+    if (_wl == null || at == null) {
+      return (
+        word: 'Нет данных',
+        color: AppColors.textSecondary,
+        sub: _hasMobileData ? 'проверяется после включения работы' : 'нужен мобильный интернет',
+      );
+    }
+    if (!fresh) {
+      return (word: 'Нет данных', color: AppColors.textSecondary, sub: 'последний замер ${agoText(at)}: ${whitelistWord(_wl).toLowerCase()}');
+    }
+    final sub = agoText(at) + (_wlProbing ? ' · проверяю…' : '');
+    switch (_wl) {
+      case 'active':
+        return (word: 'Включены', color: AppColors.success, sub: '$sub · задания с БС приходят');
+      case 'inactive':
+      case 'partial':
+        return (
+          word: whitelistWord(_wl),
+          color: _wlRequired ? AppColors.warning : AppColors.textPrimary,
+          sub: _wlRequired ? '$sub · пока БС нет, заданий нет' : sub,
+        );
+      default:
+        return (word: whitelistWord(_wl), color: AppColors.danger, sub: sub);
     }
   }
 
@@ -648,7 +788,7 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
     super.build(context);
     final mobileOn = _hasMobileData;
     return RefreshIndicator(
-      onRefresh: _refresh,
+      onRefresh: () => _refresh(forceWl: true),
       child: ListView(
         padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
         children: [
@@ -777,6 +917,16 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
           GroupedSection(
             header: 'Сеть',
             children: [
+              // 1.21.0: whether the job server answers, and whether the
+              // operator is in whitelist mode right now.
+              Builder(builder: (_) {
+                final v = _serverView();
+                return GroupedTwoLineRow(title: 'Связь с сервером', subtitle: v.sub, trailing: v.word, trailingColor: v.color);
+              }),
+              Builder(builder: (_) {
+                final v = _whitelistView();
+                return GroupedTwoLineRow(title: 'Белые списки', subtitle: v.sub, trailing: v.word, trailingColor: v.color);
+              }),
               // Three states: the network is up; the switch is on but the
               // phone has not brought the link up yet (Wi-Fi); switched off.
               GroupedRow(

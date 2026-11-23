@@ -34,7 +34,7 @@ import (
 )
 
 // version: -ldflags "-X main.version=1.0.2"
-var version = "1.0.8"
+var version = "1.0.9"
 
 const usage = `Связь Есть? — агент для компьютера (версия %s)
 
@@ -613,7 +613,7 @@ func cmdStatus(o *opts) error {
 		if t := outdatedText(s); t != "" {
 			row("Обновление", t)
 		}
-		row("Связь с сервером", nz(s.Route, "ещё не было запросов"))
+		row("Связь с сервером", serverText(s))
 		if s.Whitelist.Verdict != "" {
 			row("Белые списки", s.Whitelist.Label)
 		}
@@ -636,6 +636,53 @@ func cmdStatus(o *opts) error {
 		row("Пароль страницы", cWarn(st.SetupCode(true))+cDim(" — код настройки; свой пароль: «svyazest-agent ui-password»"))
 	}
 	return nil
+}
+
+// serverText (1.0.9): is the server answering, by which path, how long ago.
+func serverText(s runner.Status) string {
+	sv := s.Server
+	if sv.At == nil {
+		return cDim("ещё не было запросов")
+	}
+	ago := cDim(" (" + agoShort(*sv.At) + ")")
+	if !sv.OK {
+		return cBad("нет связи") + cDim(" — "+nz(sv.Error, "сервер недоступен")) + ago
+	}
+	via := ""
+	if s.Route != "" {
+		via = cDim(" через " + routeText(s.Route))
+	}
+	return cOK("есть") + via + ago
+}
+
+func agoShort(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < 5*time.Second:
+		return "только что"
+	case d < time.Minute:
+		return fmt.Sprintf("%d с назад", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%d мин назад", int(d.Minutes()))
+	default:
+		return fmt.Sprintf("%d ч назад", int(d.Hours()))
+	}
+}
+
+// routeText: "ethernet:eth0" -> "Ethernet · eth0", as on the page.
+func routeText(r string) string {
+	if r == "cellular" {
+		return "модем (запасной путь)"
+	}
+	kind, name, _ := strings.Cut(r, ":")
+	k := map[string]string{"ethernet": "Ethernet", "wifi": "Wi-Fi", "default": "по умолчанию", "other": "сеть"}[kind]
+	if k == "" {
+		k = kind
+	}
+	if name != "" {
+		return k + " · " + name
+	}
+	return k
 }
 
 func nz(a, b string) string {

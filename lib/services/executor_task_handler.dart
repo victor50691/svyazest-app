@@ -16,6 +16,7 @@ import 'checkers/subnet_checker.dart';
 import 'checkers/vpn_checker.dart';
 import 'diag_log.dart';
 import 'gps_check.dart';
+import 'link_state.dart';
 import 'native_bridge.dart';
 import 'vpn_uri_parser.dart';
 
@@ -134,6 +135,11 @@ class ExecutorTaskHandler extends TaskHandler {
   DateTime? _whitelistProbedAt;
   String? _pendingWhitelistVerdict;
   String? _lastWhitelistVerdict;
+  // When _lastWhitelistVerdict was measured, and whether the server wants
+  // БС for jobs -- for the home screen (1.21.0, services/link_state.dart).
+  DateTime? _whitelistVerdictAt;
+  bool _whitelistRequired = true;
+  String? _savedWhitelistLists;
   // Whether a «Частный DNS» was on at that measurement (the no_dns hint).
   bool _lastPrivateDns = false;
   // IPv6 of the mobile network (1.17.2): measured every [_ipv6Interval] and
@@ -359,6 +365,15 @@ class ExecutorTaskHandler extends TaskHandler {
           _lastWhitelistVerdict = _pendingWhitelistVerdict;
           _pendingWhitelistVerdict = null;
         }
+        _whitelistRequired = hb.whitelistRequired;
+        if (hb.canProbe) {
+          final lists = '${hb.whitelistAllowed.join(',')}|${hb.whitelistControl.join(',')}|${hb.whitelistRequired}';
+          if (lists != _savedWhitelistLists) {
+            _savedWhitelistLists = lists;
+            await LinkStore.saveLists(hb.whitelistAllowed, hb.whitelistControl, hb.whitelistRequired);
+          }
+        }
+        _link(true);
         // Support's log request: notification / answer / collection.
         await DiagConsent.sync(hb.diag, DiagLog.service);
         // Support's GPS check request: keep its notification up while pending.
@@ -384,7 +399,9 @@ class ExecutorTaskHandler extends TaskHandler {
           if (verdict != null && verdict != 'unknown') {
             _pendingWhitelistVerdict = verdict;
             _lastWhitelistVerdict = verdict;
+            _whitelistVerdictAt = DateTime.now();
             _lastPrivateDns = (wl['dns'] as Map?)?['private_dns'] == true;
+            _link(true);
             await _trace('whitelist verdict=$verdict dns=${wl['dns']}');
           }
         }
@@ -430,6 +447,7 @@ class ExecutorTaskHandler extends TaskHandler {
 
         final pollAt = DateTime.now();
         final job = await _api.pollJob();
+        _link(true);
         DiagLog.service.log(job == null
             ? 'опрос заданий за ${_ms(pollAt)}: пусто'
             : 'опрос заданий за ${_ms(pollAt)}: задание ${job.id}, тип ${job.resourceType}${job.protocol != null ? ', протокол ${job.protocol}' : ''}');
@@ -521,6 +539,7 @@ class ExecutorTaskHandler extends TaskHandler {
           // customer is refunded) and let the server know at once.
           _lastWhitelistVerdict = 'no_dns';
           _pendingWhitelistVerdict = 'no_dns';
+          _whitelistVerdictAt = DateTime.now();
           _lastPrivateDns = (whitelist!['dns'] as Map?)?['private_dns'] == true;
           _stopAlive();
           try {
@@ -636,6 +655,7 @@ class ExecutorTaskHandler extends TaskHandler {
           break;
         }
         _consecutiveErrors++;
+        _link(false, error: 'сервер ответил ошибкой (HTTP ${e.statusCode})');
         _report(status: 'error', title: 'Связь Есть? — сбой соединения', text: 'Повтор через несколько секунд...');
         await Future.delayed(Duration(seconds: _consecutiveErrors.clamp(1, 6) * 3));
       } catch (e, st) {
@@ -644,6 +664,7 @@ class ExecutorTaskHandler extends TaskHandler {
         final msg = '${e.runtimeType}: $e'.replaceAll(RegExp(r'\s+'), ' ');
         DiagLog.service.log('ошибка цикла #$_consecutiveErrors: $msg\n${st.toString().split('\n').take(25).join('\n')}');
         final delay = _consecutiveErrors.clamp(1, 6) * 3;
+        _link(false, error: _isNetworkError(e) ? 'сервер недоступен' : 'сбой: ${e.runtimeType}');
         // Plain network trouble (no internet, server unreachable, timeout)
         // gets a plain sentence; anything else shows class + message so a
         // phone without adb can still tell us what broke. Everything is
@@ -691,6 +712,25 @@ class ExecutorTaskHandler extends TaskHandler {
       if (_rootSignals!.isNotEmpty) DiagLog.service.log('следы root: ${_rootSignals!.join(', ')}');
     }
     return _rootSignals!;
+  }
+
+  /// The home screen's «Связь с сервером» / «Белые списки» (1.21.0): the
+  /// last exchange with the server and the last whitelist measurement --
+  /// sent to an open screen and kept for one opened later.
+  void _link(bool ok, {String? error}) {
+    final m = <String, Object?>{
+      'type': 'link',
+      'ok': ok,
+      'at': DateTime.now().millisecondsSinceEpoch,
+      'error': error,
+      'wl': _lastWhitelistVerdict,
+      'wl_at': _whitelistVerdictAt?.millisecondsSinceEpoch,
+      'wl_required': _whitelistRequired,
+    };
+    try {
+      FlutterForegroundTask.sendDataToMain(m);
+    } catch (_) {}
+    unawaited(LinkStore.save(m));
   }
 
   void _report({required String status, required String title, required String text}) {
