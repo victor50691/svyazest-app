@@ -15,6 +15,11 @@ IP-адресов/доменов прямо со своих мобильных �
 проверить Hysteria2 (работает по UDP) — обычная проверка через прокси-пул
 этого не умеет.
 
+**Для компьютеров** (Linux, Raspberry Pi, Windows — через USB-модем или
+телефон в режиме USB-модема) есть отдельный агент: исходники в
+[`desktop/`](desktop/), готовые файлы — в релизе
+[`desktop`](https://github.com/victor50691/svyazest-app/releases/tag/desktop).
+
 ---
 
 ## Содержание
@@ -188,6 +193,8 @@ android/app/src/main/kotlin/... нативная часть: биндинг на
 xraylib/                        Go-обёртка Xray-core -> xraylib.aar (gomobile)
 third_party/xray-core/          лицензия и пояснение про встроенный Xray
 test/                           виджет-тесты и тест разбора цепочки редиректов
+desktop/                        агент для Linux / Raspberry Pi / Windows (Go),
+                                см. desktop/README.md
 ```
 
 ## Сборка из исходников

@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+# Удаление (не обновление): остановить и убрать из автозапуска.
+if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
+	systemctl stop svyazest-agent.service >/dev/null 2>&1 || true
+	systemctl disable svyazest-agent.service >/dev/null 2>&1 || true
+elif [ "$1" = "remove" ] && [ -x /etc/init.d/svyazest-agent ]; then
+	/etc/init.d/svyazest-agent stop >/dev/null 2>&1 || true
+fi
+exit 0

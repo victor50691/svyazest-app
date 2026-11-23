@@ -1,0 +1,9 @@
+#!/bin/sh
+# «Связь Есть?» — агент проверок DPI//Checker (runit: Void, Artix).
+# Ставится install.sh; свои флаги — SVYAZEST_ARGS в /etc/default/svyazest-agent.
+exec 2>&1
+SVYAZEST_ARGS=""
+[ -r /etc/default/svyazest-agent ] && . /etc/default/svyazest-agent
+mkdir -p /var/lib/svyazest-agent && chmod 0700 /var/lib/svyazest-agent
+export SVYAZEST_SERVICE=1
+exec /usr/lib/svyazest-agent/svyazest-agent run --data-dir /var/lib/svyazest-agent $SVYAZEST_ARGS

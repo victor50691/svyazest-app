@@ -1,0 +1,37 @@
+# «Связь Есть?» — агент проверок DPI//Checker через мобильный модем.
+# Ставится пакетом (.deb) или install.sh; данные — /var/lib/svyazest-agent.
+# Свои флаги (например --listen 127.0.0.1:8780) — в /etc/default/svyazest-agent.
+[Unit]
+Description=Связь Есть? — агент проверок
+Documentation=https://github.com/victor50691/svyazest-app/releases/tag/desktop
+# ModemManager поднимает модем; агент работает и без него (HiLink, телефон по USB).
+After=network-online.target ModemManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/svyazest-agent
+ExecStart=/usr/lib/svyazest-agent/svyazest-agent run --data-dir /var/lib/svyazest-agent $SVYAZEST_ARGS
+Restart=always
+RestartSec=5
+# Проверки ждут таймаутов сети — даём закончить текущую.
+TimeoutStopSec=30
+KillMode=mixed
+
+# root нужен для привязки сокетов к модему (SO_BINDTODEVICE / CAP_NET_RAW)
+# и для чтения ModemManager по D-Bus; остальное закрыто.
+User=root
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_KILL
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+StateDirectory=svyazest-agent
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

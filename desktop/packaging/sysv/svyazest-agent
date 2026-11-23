@@ -1,0 +1,82 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          svyazest-agent
+# Required-Start:    $network $remote_fs
+# Required-Stop:     $network $remote_fs
+# Should-Start:      ModemManager
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Связь Есть? — агент проверок
+# Description:       Агент «Связь Есть?»: выполняет проверки DPI//Checker через мобильный модем.
+### END INIT INFO
+# SysV init (Devuan, системы без systemd / OpenRC / runit). Ставится install.sh.
+# Свои флаги — SVYAZEST_ARGS в /etc/default/svyazest-agent.
+NAME=svyazest-agent
+DAEMON=/usr/lib/svyazest-agent/svyazest-agent
+DATA=/var/lib/svyazest-agent
+LOG=/var/log/svyazest-agent.log
+RUN=/run
+[ -d "$RUN" ] || RUN=/var/run
+PIDFILE=$RUN/$NAME.pid        # следящий процесс (перезапускает агент)
+CHILDPID=$RUN/$NAME.child     # сам агент
+SVYAZEST_ARGS=""
+[ -r /etc/default/$NAME ] && . /etc/default/$NAME
+
+alive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
+pid_of() { [ -r "$1" ] && cat "$1" 2>/dev/null; }
+
+# Следящий цикл: агент упал — через 5 с снова (как Restart=always).
+supervise() {
+	trap 'c=$(pid_of "$CHILDPID"); alive "$c" && kill -TERM "$c"; exit 0' TERM INT
+	trap '' HUP
+	export SVYAZEST_SERVICE=1
+	while :; do
+		"$DAEMON" run --data-dir "$DATA" $SVYAZEST_ARGS >>"$LOG" 2>&1 &
+		echo $! > "$CHILDPID"
+		wait $!
+		sleep 5 &
+		wait $!
+	done
+}
+
+start() {
+	if alive "$(pid_of "$PIDFILE")"; then echo "$NAME уже запущен"; return 0; fi
+	[ -x "$DAEMON" ] || { echo "нет $DAEMON"; return 5; }
+	mkdir -p "$DATA" && chmod 0700 "$DATA"
+	self=/etc/init.d/$NAME
+	[ -x "$self" ] || self=$0
+	# Своя сессия: закрытие терминала, из которого запустили, не трогает агент.
+	if command -v setsid >/dev/null 2>&1; then
+		setsid "$self" _supervise </dev/null >/dev/null 2>&1 &
+	else
+		nohup "$self" _supervise </dev/null >/dev/null 2>&1 &
+	fi
+	echo $! > "$PIDFILE"
+	echo "$NAME запущен"
+}
+
+stop() {
+	sup=$(pid_of "$PIDFILE"); child=$(pid_of "$CHILDPID")
+	alive "$sup" && kill -TERM "$sup"
+	alive "$child" && kill -TERM "$child"
+	# Даём закончить текущую проверку (как TimeoutStopSec=30).
+	n=0
+	while alive "$child" && [ $n -lt 30 ]; do sleep 1; n=$((n + 1)); done
+	alive "$child" && kill -KILL "$child"
+	rm -f "$PIDFILE" "$CHILDPID"
+	echo "$NAME остановлен"
+}
+
+status() {
+	if alive "$(pid_of "$PIDFILE")"; then echo "$NAME работает"; return 0; fi
+	echo "$NAME остановлен"; return 3
+}
+
+case "${1:-}" in
+	start) start ;;
+	stop) stop ;;
+	restart|force-reload) stop; start ;;
+	status) status ;;
+	_supervise) supervise ;;
+	*) echo "Использование: $0 {start|stop|restart|status}"; exit 2 ;;
+esac

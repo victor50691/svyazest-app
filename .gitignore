@@ -64,3 +64,6 @@ app.*.map.json
 
 # Internal build-server scripts -- not part of the app.
 /build-server/
+
+# Desktop agent build output
+/desktop/dist/

@@ -1,0 +1,32 @@
+name: Desktop agent
+
+on:
+  push:
+    branches: [main]
+    paths: ['desktop/**', '.github/workflows/desktop.yml']
+  pull_request:
+    paths: ['desktop/**', '.github/workflows/desktop.yml']
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: desktop/go.mod
+          cache-dependency-path: desktop/go.sum
+
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: GOOS=windows go vet ./...
+      - run: go test ./...
+      - run: |
+          GOOS=linux GOARCH=arm64 go build -o /dev/null ./cmd/svyazest-agent
+          GOOS=linux GOARCH=arm GOARM=7 go build -o /dev/null ./cmd/svyazest-agent
+          GOOS=windows GOARCH=amd64 go build -o /dev/null ./cmd/svyazest-agent

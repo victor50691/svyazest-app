@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+if [ -d /run/systemd/system ]; then
+	systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+# purge: вход партнёра и журнал удаляются только явно (apt purge).
+if [ "$1" = "purge" ]; then
+	if [ ! -d /run/systemd/system ] && command -v update-rc.d >/dev/null 2>&1; then
+		update-rc.d -f svyazest-agent remove >/dev/null 2>&1 || true
+	fi
+	rm -rf /var/lib/svyazest-agent
+fi
+exit 0

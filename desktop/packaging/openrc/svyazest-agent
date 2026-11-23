@@ -1,0 +1,26 @@
+#!/sbin/openrc-run
+# «Связь Есть?» — агент проверок DPI//Checker (OpenRC: Alpine, Gentoo, Artix).
+# Ставится install.sh; свои флаги — SVYAZEST_ARGS в /etc/conf.d/svyazest-agent.
+name="svyazest-agent"
+description="Связь Есть? — агент проверок"
+command="/usr/lib/svyazest-agent/svyazest-agent"
+command_args="run --data-dir /var/lib/svyazest-agent ${SVYAZEST_ARGS}"
+# supervise-daemon перезапускает агент, если он упал.
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+supervise_daemon_args="--env SVYAZEST_SERVICE=1"
+output_log="/var/log/svyazest-agent.log"
+error_log="/var/log/svyazest-agent.log"
+retry="TERM/30/KILL/5"
+
+depend() {
+	need net
+	use dns dbus
+	after modemmanager ModemManager
+}
+
+start_pre() {
+	checkpath -d -m 0700 /var/lib/svyazest-agent
+	checkpath -f -m 0640 /var/log/svyazest-agent.log
+}

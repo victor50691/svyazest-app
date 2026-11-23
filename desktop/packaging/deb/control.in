@@ -1,0 +1,15 @@
+Package: svyazest-agent
+Version: @VERSION@
+Architecture: @DEBARCH@
+Maintainer: DPI//Checker <noreply@dpichecker.st>
+Installed-Size: @SIZE@
+Depends: ca-certificates
+Recommends: modemmanager
+Section: net
+Priority: optional
+Homepage: https://github.com/victor50691/svyazest-app/releases/tag/desktop
+Description: Svyaz Est? agent - DPI//Checker checks over a mobile modem
+ «Связь Есть?» для компьютеров: берёт задания DPI//Checker и выполняет их
+ через мобильный модем партнёра (USB-модем, HiLink, телефон по USB), связь
+ с сервером держит через Ethernet/Wi-Fi. Включает xray-core 26.3.27 и
+ 26.10.31 для проверки VPN-ключей.

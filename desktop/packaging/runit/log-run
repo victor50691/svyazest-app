@@ -1,0 +1,4 @@
+#!/bin/sh
+# Журнал агента: /var/log/svyazest-agent/current (svlogd сам чистит старое).
+mkdir -p /var/log/svyazest-agent
+exec svlogd -tt /var/log/svyazest-agent

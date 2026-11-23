@@ -1,0 +1,7 @@
+# Дополнительные флаги для «svyazest-agent run» (служба systemd / SysV / runit).
+# Примеры:
+#   SVYAZEST_ARGS="--listen 127.0.0.1:8780"   # веб-страница только на этом компьютере
+#   SVYAZEST_ARGS="--listen 0.0.0.0:8780"     # доступна из локальной сети
+# После правки: sudo systemctl restart svyazest-agent
+#   (без systemd: sudo /etc/init.d/svyazest-agent restart или sudo sv restart svyazest-agent)
+SVYAZEST_ARGS=""

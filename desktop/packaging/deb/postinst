@@ -1,0 +1,27 @@
+#!/bin/sh
+# «Связь Есть?»: включить и запустить службу после установки / обновления.
+set -e
+if [ "$1" = "configure" ]; then
+	install -d -m 0700 /var/lib/svyazest-agent
+	if [ -d /run/systemd/system ]; then
+		systemctl daemon-reload >/dev/null 2>&1 || true
+		systemctl enable svyazest-agent.service >/dev/null 2>&1 || true
+		if [ -n "$2" ]; then
+			# обновление: новый бинарь вступает в силу только после перезапуска
+			systemctl restart svyazest-agent.service || true
+		else
+			systemctl start svyazest-agent.service || true
+		fi
+	elif [ -x /etc/init.d/svyazest-agent ]; then
+		# Без systemd (Devuan и др., 1.0.2): скрипт SysV init из пакета.
+		if command -v update-rc.d >/dev/null 2>&1; then
+			update-rc.d svyazest-agent defaults >/dev/null 2>&1 || true
+		fi
+		if [ -n "$2" ]; then
+			/etc/init.d/svyazest-agent restart >/dev/null 2>&1 || true
+		else
+			/etc/init.d/svyazest-agent start >/dev/null 2>&1 || true
+		fi
+	fi
+fi
+exit 0

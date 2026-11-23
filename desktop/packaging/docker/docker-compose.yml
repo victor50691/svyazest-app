@@ -1,0 +1,24 @@
+# «Связь Есть?» — агент в Docker. Ставится install.sh в /opt/svyazest-agent.
+# Меню (вход, состояние): docker exec -it svyazest-agent svyazest-agent
+# Веб-страница: http://<адрес компьютера>:8780
+services:
+  svyazest-agent:
+    image: svyazest-agent:latest
+    container_name: svyazest-agent
+    # Настоящие интерфейсы хоста: проверки идут через модем, связь с
+    # сервером — через Ethernet/Wi-Fi.
+    network_mode: host
+    # Привязка сокетов к модему (SO_BINDTODEVICE) и ping.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      SVYAZEST_DATA: /data
+    volumes:
+      - ./data:/data
+      # Идентификатор компьютера — тот же, что у хоста (устройство не
+      # «меняется» при пересоздании контейнера).
+      - /etc/machine-id:/etc/machine-id:ro
+      # ModemManager хоста (оператор, сигнал, DNS модема) через mmcli.
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket:ro
+    restart: unless-stopped
