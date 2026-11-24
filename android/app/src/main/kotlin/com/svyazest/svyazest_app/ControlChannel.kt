@@ -35,6 +35,17 @@ import java.net.URL
  * The working route is remembered; it is tried first next time and
  * re-checked on failure. A route is only abandoned on a connect-phase error
  * (nothing was sent), so a POST is never delivered twice.
+ *
+ * 1.21.1 (2026-11-24, partner on Wi-Fi that does not reach the server):
+ *  - TCP + TLS must finish within [CONNECT_DEADLINE_MS], else the attempt is
+ *    cut (a hung TLS handshake used to wait the 70 s read timeout while the
+ *    Dart side gave up after 15 s, so every request kept going to Wi-Fi);
+ *  - a route that broke after connecting is also put aside, and a GET (no
+ *    body, safe to repeat) moves on to the next route at once;
+ *  - a route that keeps failing is put aside longer (1 → 2 → 4 → 8 → 10 min),
+ *    a different Wi-Fi network starts afresh;
+ *  - Wi-Fi that Android has not validated (no internet / login page) goes
+ *    after the VPN client's proxy.
  */
 object ControlChannel {
     private const val PREFS = "svyazest_control"
@@ -54,6 +65,41 @@ object ControlChannel {
     // cellular network had worked the phone never went back to the VPN
     // client's proxy even though it comes earlier in the order).
     private val failedAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    // 1.21.1: failures in a row per route (longer pause each time) and the
+    // network it failed on (another Wi-Fi network is not punished for it).
+    private val failCount = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val failedNet = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private const val CONNECT_DEADLINE_MS = 6000L
+    private val watchdog = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "control-watchdog").apply { isDaemon = true }
+    }
+
+    private fun penaltyMs(id: String): Long {
+        val n = (failCount[id] ?: 1).coerceIn(1, 5)
+        return minOf(60_000L shl (n - 1), 600_000L)
+    }
+
+    private fun markFailed(r: Route) {
+        val net = r.network?.networkHandle ?: 0L
+        val same = failedNet[r.id] == net
+        failCount[r.id] = if (same) (failCount[r.id] ?: 0) + 1 else 1
+        failedNet[r.id] = net
+        failedAt[r.id] = System.currentTimeMillis()
+        if (r.id == lastGood) lastGood = null
+        if (r.proxy != null) proxyCache = null
+    }
+
+    private fun markGood(r: Route) {
+        failedAt.remove(r.id)
+        failCount.remove(r.id)
+        failedNet.remove(r.id)
+    }
+
+    private fun penalized(r: Route, now: Long): Boolean {
+        val f = failedAt[r.id] ?: return false
+        if (r.network != null && failedNet[r.id] != r.network.networkHandle) return false
+        return now - f < penaltyMs(r.id)
+    }
 
     private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
     fun manualPort(ctx: Context): Int = prefs(ctx).getInt("proxy_port", 0)
@@ -229,16 +275,24 @@ object ControlChannel {
         val list = mutableListOf<Route>()
         networks(ctx) { it.hasTransport(NetworkCapabilities.TRANSPORT_VPN) }.firstOrNull()
             ?.let { list.add(Route("vpn", "VPN", it, null)) }
-        networks(ctx) {
+        val cmgr = cm(ctx)
+        val wifi = networks(ctx) {
             !it.hasTransport(NetworkCapabilities.TRANSPORT_VPN) && !it.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
-        }.firstOrNull()?.let { list.add(Route("wifi", "Wi-Fi", it, null)) }
+        }.sortedByDescending { n ->
+            cmgr.getNetworkCapabilities(n)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+        }.firstOrNull()
+        val wifiValidated = wifi != null &&
+            cmgr.getNetworkCapabilities(wifi)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+        val wifiRoute = wifi?.let { Route("wifi", if (wifiValidated) "Wi-Fi" else "Wi-Fi (без проверки интернета)", it, null, "Wi-Fi") }
+        if (wifiRoute != null && wifiValidated) list.add(wifiRoute)
         localProxy(ctx, host)?.let { list.add(it) }
+        if (wifiRoute != null && !wifiValidated) list.add(wifiRoute)
         networks(ctx) {
             it.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) && !it.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
         }.firstOrNull()?.let { list.add(Route("cellular", "мобильная сеть", it, null, "мобильная сеть")) }
-        // The order above, except routes that failed in the last minute go last.
+        // The order above, except routes that failed recently go last.
         val now = System.currentTimeMillis()
-        return list.sortedBy { r -> val f = failedAt[r.id]; if (f != null && now - f < 60_000) 1 else 0 }
+        return list.sortedBy { r -> if (penalized(r, now)) 1 else 0 }
     }
 
     /**
@@ -263,7 +317,11 @@ object ControlChannel {
                 }) as HttpURLConnection
                 conn.requestMethod = method
                 conn.connectTimeout = 8000
-                conn.readTimeout = readTimeoutMs
+                // 1.21.1: the Dart side gives up after 40 s on /jobs/poll (server
+                // holds it 25 s) and after ≤30 s on everything else -- waiting
+                // longer here only kept a hung route in front of the others.
+                conn.readTimeout = if (toFile != null) readTimeoutMs
+                    else minOf(readTimeoutMs, if (u.path.endsWith("/jobs/poll")) 35_000 else 30_000)
                 conn.instanceFollowRedirects = false
                 conn.useCaches = false
                 for ((k, v) in headers) conn.setRequestProperty(k, v)
@@ -272,15 +330,24 @@ object ControlChannel {
                 conn.setRequestProperty("X-Net-Route", r.id)
                 if (body != null && method != "GET") conn.doOutput = true
                 val t0 = System.currentTimeMillis()
+                // TCP + TLS within CONNECT_DEADLINE_MS: past it the attempt is
+                // cut from here (disconnect() closes the socket being set up)
+                // and the next route is tried.
+                val cut = java.util.concurrent.atomic.AtomicBoolean(false)
+                val c0: HttpURLConnection = conn
+                val guard = watchdog.schedule({ cut.set(true); runCatching { c0.disconnect() } },
+                    CONNECT_DEADLINE_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
                 try {
                     conn.connect() // TCP + TLS: nothing of the request has left yet
-                } catch (e: IOException) {
-                    lastErr = "${r.id}: ${describe(e)}"
+                    guard.cancel(false)
+                    if (cut.get()) throw IOException("не подключился за ${CONNECT_DEADLINE_MS / 1000} с")
+                } catch (e: Exception) {
+                    guard.cancel(false)
+                    val why = if (cut.get()) "не подключился за ${CONNECT_DEADLINE_MS / 1000} с (TCP/TLS)" else describe(e)
+                    lastErr = "${r.id}: $why"
                     tried.add(lastErr)
-                    NativeLog.add("связь", "${method} ${u.path}: путь «${r.label}» не подключился за ${System.currentTimeMillis() - t0} мс — ${describe(e)}")
-                    failedAt[r.id] = System.currentTimeMillis()
-                    if (r.id == lastGood) lastGood = null
-                    if (r.proxy != null) proxyCache = null
+                    markFailed(r)
+                    NativeLog.add("связь", "${method} ${u.path}: путь «${r.label}» не подключился за ${System.currentTimeMillis() - t0} мс — $why; отложен на ${penaltyMs(r.id) / 1000} с")
                     continue
                 }
                 if (body != null && conn.doOutput) conn.outputStream.use { it.write(body) }
@@ -307,16 +374,28 @@ object ControlChannel {
                 if (lastGood != r.id) NativeLog.add("связь", "путь к серверу теперь: ${r.label}")
                 if (!quiet) NativeLog.add("связь", "${method} ${u.path} → HTTP $code за ${System.currentTimeMillis() - t0} мс через «${r.label}», ${body?.size ?: 0}/${bytes.size} Б")
                 lastGood = r.id
-                failedAt.remove(r.id)
+                markGood(r)
                 lastRouteLabel = r.label
                 lastRouteShort = r.short
                 lastError = null
                 return mapOf("status" to code, "headers" to hdrs, "body" to bytes, "route" to r.label, "error" to null,
                     "failed" to tried.joinToString("; "), "saved" to saved)
             } catch (e: Exception) {
-                // After connect: the request may have reached the server -- no retry elsewhere.
+                // After connect. The route is put aside either way, so the next
+                // requests take another one (before 1.21.1 a route that connected
+                // but then hung stayed first forever).
+                markFailed(r)
+                lastErr = "${r.id}: обрыв — ${describe(e)}"
+                tried.add(lastErr)
+                // A GET carries nothing and changes nothing: repeat it on the
+                // next route at once. A POST may have reached the server -- no
+                // retry elsewhere (the caller decides).
+                if (method == "GET" && toFile == null) {
+                    NativeLog.add("связь", "${method} ${u.path}: обрыв после подключения через «${r.label}» — ${describe(e)}; повтор следующим путём, этот отложен на ${penaltyMs(r.id) / 1000} с")
+                    continue
+                }
                 lastError = "${r.id}: ${describe(e)}"
-                NativeLog.add("связь", "${method} ${u.path}: обрыв после подключения через «${r.label}» — ${describe(e)}")
+                NativeLog.add("связь", "${method} ${u.path}: обрыв после подключения через «${r.label}» — ${describe(e)}; путь отложен на ${penaltyMs(r.id) / 1000} с")
                 return mapOf("status" to 0, "headers" to emptyMap<String, String>(), "body" to ByteArray(0),
                     "route" to r.label, "error" to describe(e))
             } finally {
