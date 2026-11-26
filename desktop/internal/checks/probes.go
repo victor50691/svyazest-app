@@ -5,6 +5,7 @@ package checks
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -83,7 +84,7 @@ func whitelistProbeImpl(ctx context.Context, env Env, allowed, control []string)
 	if ok, _ := modemUp(ctx, env, 3*time.Second); !ok {
 		return map[string]any{"verdict": "no_cellular", "allowed": []any{}, "control": []any{}}
 	}
-	probeHost := func(host string) map[string]any {
+	probeHost := func(host string, needTLS bool) map[string]any {
 		var addr netip.Addr
 		via := any(nil)
 		if a, err := resolveV4(ctx, env, host, 5*time.Second); err == nil {
@@ -94,17 +95,32 @@ func whitelistProbeImpl(ctx context.Context, env Env, allowed, control []string)
 		if !addr.IsValid() {
 			return map[string]any{"host": host, "ip": nil, "icmp_ms": nil, "tcp_ms": nil, "ok": false, "dns": nil, "error": "dns"}
 		}
+		var tlsMs any
+		tlsDone := make(chan struct{})
+		go func() {
+			defer close(tlsDone)
+			if needTLS {
+				tlsMs = tlsHandshakeMs(ctx, env, addr, host, timeout)
+			}
+		}()
 		icmp, tcp := icmpTCP(ctx, env, addr, timeout)
-		return map[string]any{"host": host, "ip": addr.String(), "icmp_ms": icmp, "tcp_ms": tcp,
-			"ok": icmp != nil || tcp != nil, "dns": via, "error": nil}
+		<-tlsDone
+		ok := icmp != nil || tcp != nil
+		if needTLS {
+			// Some operators let ping or the TCP handshake through under
+			// whitelists and stall everything after it.
+			ok = tlsMs != nil
+		}
+		return map[string]any{"host": host, "ip": addr.String(), "icmp_ms": icmp, "tcp_ms": tcp, "tls_ms": tlsMs,
+			"ok": ok, "dns": via, "error": nil}
 	}
 	wait := timeout*3 + 3*time.Second
-	run := func(hosts []string) []map[string]any {
+	run := func(hosts []string, needTLS bool) []map[string]any {
 		out := make([]map[string]any, len(hosts))
 		chans := make([]chan map[string]any, len(hosts))
 		for i, h := range hosts {
 			chans[i] = make(chan map[string]any, 1)
-			go func(c chan map[string]any, h string) { c <- probeHost(h) }(chans[i], h)
+			go func(c chan map[string]any, h string) { c <- probeHost(h, needTLS) }(chans[i], h)
 		}
 		deadline := time.After(wait)
 		for i := range hosts {
@@ -122,8 +138,8 @@ func whitelistProbeImpl(ctx context.Context, env Env, allowed, control []string)
 	var allowedRes, controlRes []map[string]any
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); allowedRes = run(allowed) }()
-	go func() { defer wg.Done(); controlRes = run(control) }()
+	go func() { defer wg.Done(); allowedRes = run(allowed, false) }()
+	go func() { defer wg.Done(); controlRes = run(control, true) }()
 	wg.Wait()
 
 	count := func(rs []map[string]any, f func(map[string]any) bool) int {
@@ -177,6 +193,23 @@ func whitelistProbeImpl(ctx context.Context, env Env, allowed, control []string)
 			"private_dns": false, "private_dns_server": nil,
 		},
 	}
+}
+
+// tlsHandshakeMs = NativePlugin.tlsHandshake: TCP to :443 and a TLS
+// handshake with SNI host out of the modem; milliseconds or nil.
+func tlsHandshakeMs(ctx context.Context, env Env, addr netip.Addr, host string, timeout time.Duration) any {
+	ctx, cancel := context.WithTimeout(ctx, 2*timeout)
+	defer cancel()
+	start := time.Now()
+	raw, err := env.Net.DialContext(ctx, "tcp4", netip.AddrPortFrom(addr, 443).String())
+	if err != nil {
+		return nil
+	}
+	defer raw.Close()
+	if err := tls.Client(raw, &tls.Config{ServerName: host}).HandshakeContext(ctx); err != nil {
+		return nil
+	}
+	return time.Since(start).Milliseconds()
 }
 
 func toAnyList(ms []map[string]any) []any {

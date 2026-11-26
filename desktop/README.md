@@ -98,7 +98,7 @@ Windows, `SHA256SUMS`) собирает `./build.sh` в `dist/`:
 ```bash
 ./build.sh                    # всё
 SKIP_DOCKER=1 ./build.sh      # без образов Docker
-VERSION=1.0.9 ./build.sh
+VERSION=1.0.10 ./build.sh
 ```
 
 Кроме Go понадобятся `git`, `dpkg-deb`, `makensis` (nsis), `zip`, для

@@ -34,7 +34,7 @@ import (
 )
 
 // version: -ldflags "-X main.version=1.0.2"
-var version = "1.0.9"
+var version = "1.0.10"
 
 const usage = `Связь Есть? — агент для компьютера (версия %s)
 

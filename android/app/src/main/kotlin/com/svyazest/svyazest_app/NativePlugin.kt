@@ -622,8 +622,11 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
      *  all (an L3 block at the towers -- even ICMP to google.com dies), so
      *  `allowed` hosts (ya.ru, vk.ru, mail.ru) must answer and neutral
      *  `control` hosts must not. Each host: DNS via the cellular network,
-     *  then ICMP echo and a TCP connect to :443 in parallel; reachable = any
-     *  of the two answered. Blocking; call off the main thread.
+     *  then ICMP echo and a TCP connect to :443 in parallel. An `allowed`
+     *  host is reachable when either answered. A `control` host is reachable
+     *  only when a TLS handshake completes: some operators let ping or the
+     *  TCP handshake through under whitelists and stall everything after it.
+     *  Blocking; call off the main thread.
      *
      *  DNS is measured on its own: when the phone's resolver is dead (the
      *  operator's, or a «Частный DNS» such as dns.google, which a whitelist
@@ -633,9 +636,9 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
      *  verdict `no_dns` -- no jobs for this phone until it answers again. */
     private fun whitelistProbe(allowed: List<String>, control: List<String>, timeoutMs: Int): Map<String, Any?> {
         val net = waitForCellular(3000) ?: return mapOf("verdict" to "no_cellular", "allowed" to emptyList<Any>(), "control" to emptyList<Any>())
-        val pool = java.util.concurrent.Executors.newFixedThreadPool(12)
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(24)
         try {
-            fun probeHost(host: String): java.util.concurrent.Future<Map<String, Any?>> = pool.submit(java.util.concurrent.Callable {
+            fun probeHost(host: String, needTls: Boolean): java.util.concurrent.Future<Map<String, Any?>> = pool.submit(java.util.concurrent.Callable {
                 val sys = try {
                     net.getAllByName(host).firstOrNull { it is java.net.Inet4Address }
                 } catch (_: Exception) { null }
@@ -646,14 +649,16 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                 } else {
                     val icmp = pool.submit(java.util.concurrent.Callable { icmpPing(net, addr, timeoutMs) })
                     val tcp = pool.submit(java.util.concurrent.Callable { tcpConnect(net, addr, 443, timeoutMs) })
+                    val tls = if (needTls) pool.submit(java.util.concurrent.Callable { tlsHandshake(net, addr, host, timeoutMs) }) else null
                     val icmpMs = runCatching { icmp.get(timeoutMs + 1000L, java.util.concurrent.TimeUnit.MILLISECONDS) }.getOrNull()
                     val tcpMs = runCatching { tcp.get(timeoutMs + 1000L, java.util.concurrent.TimeUnit.MILLISECONDS) }.getOrNull()
-                    mapOf("host" to host, "ip" to addr.hostAddress, "icmp_ms" to icmpMs, "tcp_ms" to tcpMs,
-                          "ok" to (icmpMs != null || tcpMs != null), "dns" to dnsVia, "error" to null)
+                    val tlsMs = tls?.let { runCatching { it.get(timeoutMs * 2 + 1000L, java.util.concurrent.TimeUnit.MILLISECONDS) }.getOrNull() }
+                    mapOf("host" to host, "ip" to addr.hostAddress, "icmp_ms" to icmpMs, "tcp_ms" to tcpMs, "tls_ms" to tlsMs,
+                          "ok" to (if (needTls) tlsMs != null else icmpMs != null || tcpMs != null), "dns" to dnsVia, "error" to null)
                 }
             })
-            val a = allowed.map { probeHost(it) }
-            val c = control.map { probeHost(it) }
+            val a = allowed.map { probeHost(it, false) }
+            val c = control.map { probeHost(it, true) }
             val wait = (timeoutMs * 3 + 3000).toLong()
             val allowedRes = a.map { runCatching { it.get(wait, java.util.concurrent.TimeUnit.MILLISECONDS) }.getOrElse { e -> mapOf("ok" to false, "error" to e.javaClass.simpleName) } }
             val controlRes = c.map { runCatching { it.get(wait, java.util.concurrent.TimeUnit.MILLISECONDS) }.getOrElse { e -> mapOf("ok" to false, "error" to e.javaClass.simpleName) } }
@@ -904,6 +909,21 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
     private fun tcpConnect(net: Network, addr: java.net.InetAddress, port: Int, timeoutMs: Int): Long? = try {
         val start = System.nanoTime()
         net.socketFactory.createSocket().use { it.connect(java.net.InetSocketAddress(addr, port), timeoutMs) }
+        (System.nanoTime() - start) / 1_000_000L
+    } catch (_: Exception) {
+        null
+    }
+
+    /** TCP connect to :443 and a full TLS handshake with SNI [host] over
+     *  [net]. Milliseconds, or null when it failed or stalled. */
+    private fun tlsHandshake(net: Network, addr: java.net.InetAddress, host: String, timeoutMs: Int): Long? = try {
+        val start = System.nanoTime()
+        net.socketFactory.createSocket().use { raw ->
+            raw.connect(java.net.InetSocketAddress(addr, 443), timeoutMs)
+            raw.soTimeout = timeoutMs
+            val factory = javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
+            (factory.createSocket(raw, host, 443, true) as javax.net.ssl.SSLSocket).use { it.startHandshake() }
+        }
         (System.nanoTime() - start) / 1_000_000L
     } catch (_: Exception) {
         null

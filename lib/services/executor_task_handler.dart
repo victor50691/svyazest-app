@@ -97,7 +97,8 @@ class ExecutorTaskHandler extends TaskHandler {
   static String _wlSummary(Map<String, dynamic>? w) {
     if (w == null) return 'не замерялись';
     String side(Object? a) => ((a as List?) ?? const []).whereType<Map>()
-        .map((x) => '${x['host']}:${x['ok'] == true ? 'ок' : 'нет'}${x['tcp_ms'] != null ? '/${x['tcp_ms']}мс' : ''}').join(',');
+        .map((x) => '${x['host']}:${x['ok'] == true ? 'ок' : 'нет'}${x['tcp_ms'] != null ? '/${x['tcp_ms']}мс' : ''}'
+            '${x['tls_ms'] != null ? '/tls ${x['tls_ms']}мс' : ''}').join(',');
     final dns = w['dns'] is Map ? w['dns'] as Map : const {};
     return 'вердикт=${w['verdict']}; из БС: ${side(w['allowed'])}; контрольные: ${side(w['control'])}; '
         'DNS ${dns['verdict']} (системный ${dns['system']}/${dns['total']}, запасной ${dns['fallback']}, частный DNS ${dns['private_dns']})';
