@@ -33,6 +33,9 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
   bool _isRunning = false;
   bool _hasMobileData = false;
   bool? _mobileSetting; // the phone's mobile-data switch, see NetworkState
+  // Checks go through a SIM router's Wi-Fi (1.22.0); then _hasMobileData
+  // means «that Wi-Fi is there».
+  bool _wifi = false;
   bool _hasVpn = false;
   String _statusText = 'Ожидание запуска...';
   String _serviceStatus = ''; // last status code from the service (online, no_mobile_data, ...)
@@ -157,11 +160,13 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
     // (cellular probe up to 4 s behind a VPN, profile over the network) run
     // after that and never hold the switch.
     final running = await FlutterForegroundTask.isRunningService;
+    final wifi = await NativeBridge.wifiChecks();
     final net = await NativeBridge.networkState();
     await _checkPermissions();
     if (!mounted) return;
     setState(() {
       if (!_busy) _isRunning = running;
+      _wifi = wifi;
       _hasMobileData = net.mobile;
       _hasVpn = net.vpn;
       _mobileSetting = net.mobileSetting;
@@ -579,13 +584,13 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
     // The server trusts a measurement for 15 minutes; older is not «now».
     final fresh = at != null && DateTime.now().difference(at) < const Duration(minutes: 15);
     if (_wlProbing && !fresh) {
-      return (word: 'Проверяю…', color: AppColors.textSecondary, sub: 'замер через мобильную сеть');
+      return (word: 'Проверяю…', color: AppColors.textSecondary, sub: _wifi ? 'замер через Wi-Fi роутера' : 'замер через мобильную сеть');
     }
     if (_wl == null || at == null) {
       return (
         word: 'Нет данных',
         color: AppColors.textSecondary,
-        sub: _hasMobileData ? 'проверяется после включения работы' : 'нужен мобильный интернет',
+        sub: _hasMobileData ? 'проверяется после включения работы' : (_wifi ? 'нужен Wi-Fi роутера' : 'нужен мобильный интернет'),
       );
     }
     if (!fresh) {
@@ -930,13 +935,15 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
               // Three states: the network is up; the switch is on but the
               // phone has not brought the link up yet (Wi-Fi); switched off.
               GroupedRow(
-                label: 'Мобильный интернет',
-                value: mobileOn
-                    ? 'Включён'
-                    : (_mobileSetting == true ? 'Включён, нет сети' : 'Выключен'),
+                label: _wifi ? 'Проверки через Wi-Fi роутера' : 'Мобильный интернет',
+                value: _wifi
+                    ? (mobileOn ? 'Подключён' : 'Нет Wi-Fi')
+                    : mobileOn
+                        ? 'Включён'
+                        : (_mobileSetting == true ? 'Включён, нет сети' : 'Выключен'),
                 valueColor: mobileOn
                     ? AppColors.success
-                    : (_mobileSetting == true ? AppColors.warning : AppColors.danger),
+                    : (!_wifi && _mobileSetting == true ? AppColors.warning : AppColors.danger),
               ),
               GroupedRow(
                 label: 'Сторонний VPN',
@@ -993,7 +1000,7 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver, Automati
             const Padding(
               padding: EdgeInsets.symmetric(horizontal: 16),
               child: Text(
-                'Сторонний VPN обнаружен. Проверки всё равно идут напрямую через мобильный интернет, минуя VPN.',
+                'Сторонний VPN обнаружен. Проверки всё равно идут напрямую через выбранную сеть, минуя VPN.',
                 style: TextStyle(fontSize: 13, color: AppColors.textSecondary),
               ),
             ),

@@ -29,7 +29,12 @@ class HeartbeatReply {
     this.gps,
     this.attestDue = false,
     this.integrityHold,
+    this.wifiChecks,
   });
+
+  /// 1.22.0: check through the Wi-Fi of a SIM router (set by the admin).
+  /// null = the server did not say.
+  final bool? wifiChecks;
 
   /// The hardware-bound key is due for its daily re-attestation (1.16.0).
   final bool attestDue;
@@ -218,12 +223,16 @@ class ApiClient {
   }) async {
     final token = await SecureStore.getDeviceToken();
     if (token == null) return const HeartbeatReply();
+    final netChannel = await NativeBridge.wifiChecks() ? 'wifi' : 'cellular';
     final resp = await _client
         .post(
           _u('/heartbeat'),
           headers: _jsonHeaders(token),
           body: jsonEncode({
             'mobile_data_enabled': mobileDataEnabled,
+            // 1.22.0: what checks and the whitelist probe go through; the
+            // server gives jobs only while it matches its `wifi_checks`.
+            'net_channel': netChannel,
             'is_online': isOnline,
             'operator_name': ?operatorName,
             'hwid': ?hwid,
@@ -254,6 +263,7 @@ class ApiClient {
       gps: GpsInfo.fromJson(body['gps']),
       attestDue: body['attest_due'] == true,
       integrityHold: body['integrity_hold'] as String?,
+      wifiChecks: body['wifi_checks'] as bool?,
     );
   }
 

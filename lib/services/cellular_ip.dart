@@ -20,6 +20,13 @@ class CellularIp {
   static DateTime? _at;
   static Map<String, dynamic>? _last;
 
+  /// The channel changed (mobile data <-> router Wi-Fi): the cached address
+  /// belongs to the other one.
+  static void reset() {
+    _at = null;
+    _last = null;
+  }
+
   static Future<Map<String, dynamic>> measure({String? token}) async {
     final at = _at;
     if (at != null && _last != null && _last!['ip'] != null && DateTime.now().difference(at) < const Duration(minutes: 2)) {

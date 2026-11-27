@@ -150,6 +150,28 @@ class ExecutorTaskHandler extends TaskHandler {
   DateTime? _ipv6At;
   static const _ipv6Interval = Duration(minutes: 10);
 
+  /// Checks go through the Wi-Fi of a SIM router (1.22.0), as the server
+  /// said last; mirrors NativeBridge.wifiChecks.
+  bool _wifi = false;
+
+  /// The server's `wifi_checks`. On a change everything measured through the
+  /// other network is dropped and measured again. True = it changed.
+  Future<bool> _applyChannel(bool? wifi) async {
+    if (wifi == null || wifi == _wifi) return false;
+    await NativeBridge.setWifiChecks(wifi);
+    _wifi = wifi;
+    _whitelistProbedAt = null;
+    _pendingWhitelistVerdict = null;
+    _lastWhitelistVerdict = null;
+    _whitelistVerdictAt = null;
+    _ipv6Ok = null;
+    _ipv6At = null;
+    CellularIp.reset();
+    DiagLog.service.log(wifi ? 'сервер: проверки через Wi-Fi роутера' : 'сервер: проверки через мобильную сеть');
+    _link(true);
+    return true;
+  }
+
   /// IPv6 works over the cellular network = it has a global IPv6 address and
   /// an IPv6 default route (LinkProperties, no traffic), and Yandex's
   /// IPv6-only echo answers over it (Yandex is in every whitelist, so this
@@ -278,6 +300,7 @@ class ExecutorTaskHandler extends TaskHandler {
           await FlutterForegroundTask.stopService();
           break;
         }
+        _wifi = await NativeBridge.wifiChecks();
         bool hasMobileData;
         try {
           hasMobileData = await NativeBridge.hasMobileData();
@@ -314,9 +337,13 @@ class ExecutorTaskHandler extends TaskHandler {
             await NativeBridge.bindProcessToCellular(false);
             try {
               _hwid ??= await NativeBridge.hwid();
-              await _api
+              final off = await _api
                   .heartbeat(mobileDataEnabled: false, isOnline: true, hwid: _hwid)
                   .timeout(const Duration(seconds: 5));
+              if (await _applyChannel(off.wifiChecks)) {
+                _offlineReportedAt = null;
+                continue;
+              }
             } catch (_) {
               _offlineReportedAt = null; // not delivered -- retry next cycle
             }
@@ -327,7 +354,9 @@ class ExecutorTaskHandler extends TaskHandler {
           _report(
             status: 'no_mobile_data',
             title: 'Связь Есть? — офлайн',
-            text: st.mobileSetting == true ? 'Ожидание мобильной сети...' : 'Включите мобильный интернет',
+            text: _wifi
+                ? 'Подключитесь к Wi-Fi роутера с SIM-картой'
+                : (st.mobileSetting == true ? 'Ожидание мобильной сети...' : 'Включите мобильный интернет'),
           );
           await Future.delayed(const Duration(seconds: 5));
           continue;
@@ -344,7 +373,10 @@ class ExecutorTaskHandler extends TaskHandler {
         // Liveness for "did the last run end abruptly" (see onStart), every cycle.
         unawaited(FlutterForegroundTask.saveData(key: 'svc_alive', value: DateTime.now().millisecondsSinceEpoch).catchError((_) => false));
         unawaited(DiagLog.service.envTick());
-        if (_ipv6At == null || DateTime.now().difference(_ipv6At!) >= _ipv6Interval) {
+        // IPv6 checks are not given over a router's Wi-Fi.
+        if (_wifi) {
+          _ipv6Ok = false;
+        } else if (_ipv6At == null || DateTime.now().difference(_ipv6At!) >= _ipv6Interval) {
           try {
             await _measureIpv6();
           } catch (e) {
@@ -362,6 +394,7 @@ class ExecutorTaskHandler extends TaskHandler {
           rooted: _rooted ??= await NativeBridge.isRooted(),
           rootSignals: await _currentRootSignals(),
         );
+        if (await _applyChannel(hb.wifiChecks)) continue;
         if (_pendingWhitelistVerdict != null) {
           _lastWhitelistVerdict = _pendingWhitelistVerdict;
           _pendingWhitelistVerdict = null;
@@ -417,16 +450,16 @@ class ExecutorTaskHandler extends TaskHandler {
             title: 'Связь Есть? — не работает DNS',
             text: _lastPrivateDns
                 ? 'Отключите «Частный DNS» в настройках телефона — заданий нет'
-                : 'DNS мобильной сети не отвечает — заданий нет',
+                : (_wifi ? 'DNS сети роутера не отвечает — заданий нет' : 'DNS мобильной сети не отвечает — заданий нет'),
           );
-        } else if (hb.whitelistRequired && _lastWhitelistVerdict != null && _lastWhitelistVerdict != 'active') {
+        } else if ((hb.whitelistRequired || _wifi) && _lastWhitelistVerdict != null && _lastWhitelistVerdict != 'active') {
           // Nothing to measure for a БС check while the operator is not in
           // whitelist mode: say so plainly instead of "waiting for jobs",
           // which would look like the network is idle.
           _report(
             status: 'no_whitelist',
             title: 'Связь Есть? — онлайн',
-            text: 'Белые списки у оператора не включены — заданий нет',
+            text: _wifi ? 'В сети роутера белые списки не включены — заданий нет' : 'Белые списки у оператора не включены — заданий нет',
           );
         } else {
           _report(status: 'online', title: 'Связь Есть? — онлайн', text: 'Ожидание заданий...');
@@ -495,10 +528,10 @@ class ExecutorTaskHandler extends TaskHandler {
           final vpnOn = await NativeBridge.hasActiveVpn();
           _report(
             status: 'cellular_blocked',
-            title: 'Связь Есть? — нет выхода через мобильную сеть',
+            title: _wifi ? 'Связь Есть? — нет выхода через Wi-Fi' : 'Связь Есть? — нет выхода через мобильную сеть',
             text: vpnOn
                 ? 'VPN не разрешает обход — добавьте приложение в исключения VPN или выключите VPN'
-                : 'Мобильная сеть недоступна для приложения (${bind.error ?? 'unknown'})',
+                : '${_wifi ? 'Wi-Fi' : 'Мобильная сеть'} недоступна для приложения (${bind.error ?? 'unknown'})',
           );
           _stopAlive();
           try {
@@ -597,6 +630,7 @@ class ExecutorTaskHandler extends TaskHandler {
         // to the cellular network for the check (false = default route,
         // which may have been a VPN).
         result['bound_cellular'] = pinned;
+        if (_wifi) result['net_channel'] = 'wifi';
         result['vpn_active'] = await NativeBridge.hasActiveVpn();
         if (whitelist != null) result['whitelist'] = whitelist;
         result['cellular_ip'] = cellularIp;

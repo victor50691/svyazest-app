@@ -68,7 +68,7 @@ String whitelistWord(String? verdict) {
     case 'no_internet':
       return 'Нет интернета';
     case 'no_cellular':
-      return 'Нет мобильной сети';
+      return 'Нет сети для проверок';
     default:
       return 'Нет данных';
   }

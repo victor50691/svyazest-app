@@ -51,6 +51,8 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
         const val FALLBACK_DNS = "77.88.8.8"
         const val DEVICE_KEY_ALIAS = "svyazest_device_key"
         val DEVICE_KEY_LOCK = Any()
+        private const val NET_PREFS = "svyazest_net"
+        private const val KEY_WIFI_CHECKS = "wifi_checks"
     }
 
     private lateinit var context: Context
@@ -120,6 +122,13 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             // third_party/xray-core/README.md) lives once installed.
             "nativeLibraryDir" -> result.success(context.applicationInfo.nativeLibraryDir)
             "hasMobileData" -> result.success(hasMobileData())
+            // Checks through a SIM router's Wi-Fi (1.22.0, the server's
+            // `wifi_checks`): see [findCheckNet].
+            "wifiChecks" -> result.success(wifiChecks())
+            "setWifiChecks" -> {
+                setWifiChecks(call.argument<Boolean>("enable") == true)
+                result.success(null)
+            }
             "hasActiveVpn" -> result.success(hasActiveVpn())
             "networkState" -> result.success(networkState())
             "isRooted" -> result.success(isRooted())
@@ -167,10 +176,10 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                     // "not bound" on the first cycle.
                     val waitMs = (call.argument<Int>("waitMs") ?: 0).toLong()
                     Thread {
-                        val net = waitForCellular(waitMs)
+                        val net = waitForCheckNet(waitMs)
                         var error: String? = null
                         val ok = if (net == null) {
-                            error = "no cellular network"
+                            error = if (wifiChecks()) "no wifi network" else "no cellular network"
                             false
                         } else try {
                             cm().bindProcessToNetwork(net).also { if (!it) error = "bindProcessToNetwork returned false" }
@@ -179,7 +188,7 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                             false
                         }
                         lastBindError = error
-                        NativeLog.add("мобильная", if (ok) "процесс привязан к мобильной сети $net" else "привязать процесс к мобильной сети не удалось: $error")
+                        NativeLog.add("мобильная", if (ok) "процесс привязан к ${if (wifiChecks()) "Wi-Fi" else "мобильной сети"} $net" else "привязать процесс к сети проверок не удалось: $error")
                         mainHandler.post { result.success(mapOf("ok" to ok, "cellular" to (net != null), "error" to error)) }
                     }.start()
                 } else {
@@ -351,7 +360,7 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                 if (call.argument<String>("core") == "next") {
                     // Xray-core 26.10 as its own process (XrayNext.kt).
                     Thread {
-                        val err = runCatching { XrayNext.start(context, config, findCellular()) }.getOrElse { "xray 26.10: ${it.javaClass.simpleName}" }
+                        val err = runCatching { XrayNext.start(context, config, findCheckNet()) }.getOrElse { "xray 26.10: ${it.javaClass.simpleName}" }
                         mainHandler.post { result.success(err) }
                     }.start()
                     return
@@ -408,7 +417,7 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
      *  just the default one, because while a third-party VPN is active the
      *  default network is the VPN, and on Android < 12 its capabilities do
      *  not carry the underlying transport. */
-    private fun hasMobileData(): Boolean = findCellular() != null
+    private fun hasMobileData(): Boolean = findCheckNet() != null
 
     private fun hasActiveVpn(): Boolean {
         val cm = cm()
@@ -450,6 +459,51 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
     private fun stopWatching() {
         networkCallback?.let { try { cm().unregisterNetworkCallback(it) } catch (_: Exception) {} }
         networkCallback = null
+    }
+
+    // ---- the network checks go through: mobile data, or a SIM router's Wi-Fi ----
+
+    private fun netPrefs() = context.getSharedPreferences(NET_PREFS, Context.MODE_PRIVATE)
+
+    /** Set by the admin for this device (heartbeat `wifi_checks`): the phone
+     *  sits on the Wi-Fi of a router with a SIM card and checks go through
+     *  it. Kept in preferences: the screen's and the service's engines both
+     *  read it, also after a restart. */
+    private fun wifiChecks(): Boolean = netPrefs().getBoolean(KEY_WIFI_CHECKS, false)
+
+    private fun setWifiChecks(on: Boolean) {
+        if (on == wifiChecks()) return
+        netPrefs().edit().putBoolean(KEY_WIFI_CHECKS, on).apply()
+        runCatching { cm().bindProcessToNetwork(null) }
+        NativeLog.add("мобильная", if (on) "проверки переключены на Wi-Fi" else "проверки переключены на мобильную сеть")
+    }
+
+    /** Wi-Fi (or wired) network with internet that is not a VPN. Under
+     *  whitelists Android marks it «без интернета», but it stays listed. */
+    private fun findWifi(): Network? {
+        val cm = cm()
+        val nets: Array<Network> = try { cm.allNetworks } catch (_: Exception) { emptyArray() }
+        for (n in nets) {
+            val caps = cm.getNetworkCapabilities(n) ?: continue
+            if ((caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+            ) return n
+        }
+        return null
+    }
+
+    /** The network every check (and the whitelist probe) leaves through. */
+    private fun findCheckNet(): Network? = if (wifiChecks()) findWifi() else findCellular()
+
+    private fun waitForCheckNet(maxWaitMs: Long): Network? {
+        val deadline = System.currentTimeMillis() + maxWaitMs
+        while (true) {
+            findCheckNet()?.let { return it }
+            if (System.currentTimeMillis() >= deadline) return null
+            try { Thread.sleep(250) } catch (_: InterruptedException) { return null }
+        }
     }
 
     // ---- cellular: keep a mobile-data Network around and pin sockets to it ----
@@ -537,11 +591,11 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
         // Cellular preferred (that is what the checks use); if it is down the
         // probe goes over whatever non-VPN network exists -- the EPERM a
         // no-bypass VPN answers with is the same on every network.
-        val cellNet = waitForCellular(3000)
+        val cellNet = waitForCheckNet(3000)
         val net = cellNet ?: findAnyNonVpn()
             ?: return mapOf("lockdown" to false, "vpn" to true,
                             "detail" to "no non-vpn network (cellularRequest=${cellularRequestError ?: "ok"})")
-        val via = if (cellNet != null) "cellular" else "other"
+        val via = if (cellNet == null) "other" else if (wifiChecks()) "wifi" else "cellular"
         // What the cellular network actually offers (v4/v6 addresses, routes,
         // interface) -- an IPv6-only APN without 464xlat makes IPv4 targets
         // "unreachable" and must not be mistaken for a kill switch.
@@ -635,7 +689,7 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
      *  of [FALLBACK_DNS] directly, and a dead system resolver makes the
      *  verdict `no_dns` -- no jobs for this phone until it answers again. */
     private fun whitelistProbe(allowed: List<String>, control: List<String>, timeoutMs: Int): Map<String, Any?> {
-        val net = waitForCellular(3000) ?: return mapOf("verdict" to "no_cellular", "allowed" to emptyList<Any>(), "control" to emptyList<Any>())
+        val net = waitForCheckNet(3000) ?: return mapOf("verdict" to "no_cellular", "allowed" to emptyList<Any>(), "control" to emptyList<Any>())
         val pool = java.util.concurrent.Executors.newFixedThreadPool(24)
         try {
             fun probeHost(host: String, needTls: Boolean): java.util.concurrent.Future<Map<String, Any?>> = pool.submit(java.util.concurrent.Callable {
@@ -765,7 +819,7 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
      *  the cellular network, the same measurement as [whitelistProbe] does
      *  per host. Blocking; call off the main thread. */
     private fun hostProbe(host: String, timeoutMs: Int, family: Int = 4): Map<String, Any?> {
-        val net = waitForCellular(3000) ?: return mapOf("host" to host, "ip" to null, "icmp_ms" to null, "tcp_ms" to null, "error" to "no_cellular")
+        val net = waitForCheckNet(3000) ?: return mapOf("host" to host, "ip" to null, "icmp_ms" to null, "tcp_ms" to null, "error" to "no_cellular")
         // family 6 (1.17.2): an IPv6 address / a domain's AAAA, ICMPv6 echo.
         val bare = host.removePrefix("[").removeSuffix("]")
         val addr = try {
@@ -797,7 +851,7 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
         val octets = base.split('.')
         if (octets.size != 4) return mapOf("cidr" to cidr, "error" to "bad_cidr")
         val prefix = octets.take(3).joinToString(".")
-        val net = waitForCellular(3000)
+        val net = waitForCheckNet(3000)
             ?: return mapOf("cidr" to cidr, "error" to "no_cellular")
 
         val pool = java.util.concurrent.Executors.newFixedThreadPool(concurrency.coerceIn(1, 64))
@@ -966,10 +1020,10 @@ class NativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
      *  cover these sockets -- this callback is why Xray is embedded. */
     private val socketBinder = object : xraylib.SocketBinder {
         override fun bind(fd: Long): Boolean {
-            val net = findCellular()
+            val net = findCheckNet()
             val pfd = try { ParcelFileDescriptor.fromFd(fd.toInt()) } catch (_: Exception) { null }
             if (net == null || pfd == null) {
-                lastBindError = if (net == null) "no cellular network" else "bad fd"
+                lastBindError = if (net == null) "no check network" else "bad fd"
                 bindFail.incrementAndGet()
                 pfd?.let { killSocket(it) }
                 return false

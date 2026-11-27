@@ -36,6 +36,22 @@ class NativeBridge {
     return result ?? false;
   }
 
+  /// Checks go through the Wi-Fi of a SIM router instead of mobile data
+  /// (1.22.0, switched on by the admin for this device).
+  static Future<bool> wifiChecks() async {
+    try {
+      return await _channel.invokeMethod<bool>('wifiChecks') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> setWifiChecks(bool enable) async {
+    try {
+      await _channel.invokeMethod<void>('setWifiChecks', {'enable': enable});
+    } catch (_) {}
+  }
+
   static Future<bool> hasActiveVpn() async {
     final result = await _channel.invokeMethod<bool>('hasActiveVpn');
     return result ?? false;
